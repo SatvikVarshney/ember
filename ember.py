@@ -10,7 +10,10 @@ inside it animates, which avoids janky window-manager resizes; an input shape
 region keeps clicks on the transparent area falling through to the desktop.
 """
 
+import atexit
 import math
+import os
+import sys
 import threading
 import time
 
@@ -19,14 +22,24 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Pango", "1.0")
-from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
 
 import cairo  # noqa: E402
 
 import config as cfg  # noqa: E402
+import ipc  # noqa: E402
+import launcher  # noqa: E402
 from runner import EmberRunner, strip_markdown  # noqa: E402
 
 IDLE, LISTENING, THINKING, RESPONDING, ERROR = "idle", "listening", "thinking", "responding", "error"
+
+DEBUG = bool(os.environ.get("EMBER_DEBUG"))
+
+
+def trace(*parts):
+    if DEBUG:
+        print(f"[{time.monotonic():9.3f}]", *parts, file=sys.stderr, flush=True)
 
 # The canvas is the fixed transparent window the card grows inside. It must be
 # comfortably taller than the tallest card, because _apply_card_size centres the
@@ -37,6 +50,19 @@ MAX_CARD_H = 460
 DOT_ABOVE_BOTTOM = 150
 ANIM_MS = 16
 ANIM_DURATION = 0.34
+
+# Ceiling for the results list. Left deliberately short of MAX_CARD_H so the
+# entry and footer always have room -- the list scrolls rather than pushing
+# them out of the card.
+MAX_RESULTS_H = 260
+
+# Focus-out must not collapse the card instantly. Pressing the hotkey makes
+# gnome-shell take focus for its own key grab, and that fires focus-out about
+# 30ms BEFORE the toggle message arrives on the socket. Collapsing straight
+# away meant the toggle then found an idle widget and re-summoned it, so the
+# hotkey could open Ember but never close it. Deferring a few frames lets the
+# toggle land first and be read as the dismiss it is.
+FOCUS_OUT_GRACE_MS = 140
 
 
 def ease_out_cubic(t):
@@ -68,9 +94,24 @@ class Ember(Gtk.Window):
         self._drag_origin = None
         self._pending_model = self.config.get("model", "haiku")
 
+        # Local resolution: the whole point is that "brave" or "vol 40" never
+        # reaches a model. `_results` is what is currently on offer, `_rows`
+        # pairs each ListBox row with the Result it will activate, and `_sel`
+        # is the highlighted index -- tracked by hand because the entry keeps
+        # keyboard focus, so the ListBox never gets the arrow keys itself.
+        self._index = launcher.AppIndex()
+        self._results = []
+        self._rows = []
+        self._sel = 0
+        self._raised = False
+        self._focus_collapse_id = None
+
         self._build_window()
         self._build_ui()
         self._apply_css()
+
+        # First scan reads ~190 files; off the UI thread so startup stays snappy.
+        threading.Thread(target=self._index.refresh, daemon=True).start()
 
         GLib.timeout_add(ANIM_MS, self._on_pulse_tick)
 
@@ -100,11 +141,16 @@ class Ember(Gtk.Window):
         self.connect("destroy", Gtk.main_quit)
         self.connect("key-press-event", self._on_key)
         self.connect("focus-out-event", self._on_focus_out)
+        self.connect("focus-in-event", self._on_focus_in)
         self.connect("window-state-event", self._on_window_state)
         self.connect("realize", lambda *_: self._place_window())
 
     def _apply_stacking(self):
-        if self.config.get("keep_above"):
+        # `_raised` is the hotkey summon. Ember normally lives below working
+        # windows, but a command centre opened by Super+Space has to be on top
+        # of whatever is in front. Mutter does honour ABOVE on a DESKTOP-type
+        # window and still gives it focus -- verified on GNOME 46 / X11.
+        if self._raised or self.config.get("keep_above"):
             self.set_keep_below(False)
             self.set_keep_above(True)
         else:
@@ -186,6 +232,22 @@ class Ember(Gtk.Window):
         self.entry.connect("changed", self._on_typing)
         inner.pack_start(self.entry, False, False, 0)
 
+        # Results sit *below* the input, which is the layout every launcher
+        # uses and the one the hands already know.
+        self.results = Gtk.ListBox()
+        self.results.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.results.set_activate_on_single_click(True)
+        self.results.get_style_context().add_class("ember-results")
+        self.results.connect("row-activated", self._on_row_activated)
+
+        self._results_scroll = Gtk.ScrolledWindow()
+        self._results_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._results_scroll.set_propagate_natural_height(True)
+        self._results_scroll.set_max_content_height(MAX_RESULTS_H)
+        self._results_scroll.set_shadow_type(Gtk.ShadowType.NONE)
+        self._results_scroll.add(self.results)
+        inner.pack_start(self._results_scroll, False, False, 0)
+
         self.footer = Gtk.Label(xalign=0.0)
         self.footer.get_style_context().add_class("ember-footer")
         inner.pack_start(self.footer, False, False, 0)
@@ -233,6 +295,29 @@ class Ember(Gtk.Window):
             color: alpha({colors['text']}, 0.45);
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {max(11, size - 6)}px;
+        }}
+        /* Rows have to sit inside the cream surface, not on top of it, so the
+           list itself stays transparent and only the selection is painted. */
+        .ember-results, .ember-results row {{
+            background-color: transparent;
+            border: none;
+        }}
+        .ember-results row {{ border-radius: 14px; }}
+        .ember-results row:selected {{
+            background-color: alpha({colors['dot']}, 0.38);
+        }}
+        .ember-results row:hover {{
+            background-color: alpha({colors['dot']}, 0.18);
+        }}
+        .ember-row-title {{
+            color: {colors['text']};
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {max(13, size - 3)}px;
+        }}
+        .ember-row-sub {{
+            color: alpha({colors['text']}, 0.5);
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {max(10, size - 7)}px;
         }}
         """
         provider = Gtk.CssProvider()
@@ -297,46 +382,83 @@ class Ember(Gtk.Window):
         # _inner carries its own border width, so its natural height already
         # includes the padding -- adding more here double-counts it and leaves
         # a dead gap under the text.
-        # Height must be computed *for the known width*: a wrapping label asked
-        # for its plain preferred height reports almost nothing, which left the
-        # card stuck at its minimum no matter how long the reply was.
-        width = self.config["active_width"] - 72
-        self.msg.set_size_request(width, -1)
-        _, text_h = self.msg.get_preferred_height_for_width(width)
-
-        visible_h = min(text_h, MAX_CARD_H - 110)
-        self._msg_scroll.set_size_request(-1, visible_h)
-
         extra = 40  # _inner border top+bottom
+        body = 0
+
+        if self._msg_scroll.get_visible():
+            # Height must be computed *for the known width*: a wrapping label
+            # asked for its plain preferred height reports almost nothing,
+            # which left the card stuck at its minimum no matter how long the
+            # reply was.
+            width = self.config["active_width"] - 72
+            self.msg.set_size_request(width, -1)
+            _, text_h = self.msg.get_preferred_height_for_width(width)
+            visible_h = min(text_h, MAX_CARD_H - 110)
+            self._msg_scroll.set_size_request(-1, visible_h)
+            body += visible_h
+
+        if self._results_scroll.get_visible():
+            _, rows_h = self.results.get_preferred_height()
+            rows_h = min(rows_h, MAX_RESULTS_H)
+            self._results_scroll.set_size_request(-1, rows_h)
+            body += rows_h + 6
+
         if self.entry.get_visible():
             extra += self.entry.get_preferred_height()[1] + 6
         if self.footer.get_visible():
             extra += self.footer.get_preferred_height()[1] + 6
-        return max(72, min(visible_h + extra, MAX_CARD_H))
+        return max(72, min(body + extra, MAX_CARD_H))
+
+    def _body_visibility(self):
+        """The greeting and the results list are mutually exclusive.
+
+        While the list is up the greeting would only push the rows further from
+        the input for no benefit, and the rows are the thing being read.
+        """
+        listing = self.state == LISTENING and bool(self._results)
+        showing_msg = self.state in (LISTENING, RESPONDING, ERROR) and not listing
+        return showing_msg, listing
+
+    @staticmethod
+    def _show_widget(widget, visible, deep=False):
+        widget.set_no_show_all(not visible)
+        widget.set_visible(visible)
+        if visible:
+            widget.show_all() if deep else widget.show()
 
     def _set_state(self, state, animate=True):
         self.state = state
         # The input stays put after a reply so a follow-up is just typing --
         # the conversation carries on in the same session rather than each
         # exchange being a one-shot.
+        if state != LISTENING:
+            # Offers belong to the query that produced them; carrying them into
+            # a reply would leave stale rows under the answer.
+            self._results = []
+            self._clear_rows()
+
         showing_input = state in (LISTENING, RESPONDING, ERROR)
-        showing_msg = state in (LISTENING, RESPONDING, ERROR)
         showing_footer = state in (RESPONDING, ERROR)
         showing_dot = state in (IDLE, THINKING)
+        showing_msg, showing_results = self._body_visibility()
 
-        for widget, visible in (
-            (self.dot, showing_dot),
-            (self._msg_scroll, showing_msg),
-            (self.entry, showing_input),
-            (self.footer, showing_footer),
+        for widget, visible, deep in (
+            (self.dot, showing_dot, False),
+            (self._msg_scroll, showing_msg, True),
+            (self.entry, showing_input, False),
+            (self._results_scroll, showing_results, True),
+            (self.footer, showing_footer, False),
         ):
-            widget.set_no_show_all(not visible)
-            widget.set_visible(visible)
-            if visible:
-                widget.show_all() if widget is self._msg_scroll else widget.show()
+            self._show_widget(widget, visible, deep)
 
         self._inner.set_border_width(0 if state == IDLE else 20)
         self._update_opacity()
+
+        # Any route back to rest also drops the hotkey raise, so Ember can
+        # never get stranded above the working windows.
+        if state == IDLE and self._raised:
+            self._raised = False
+            self._apply_stacking()
 
         if showing_input:
             self.entry.grab_focus()
@@ -351,7 +473,166 @@ class Ember(Gtk.Window):
         # Starting a follow-up must not be cut off by the collapse timer that
         # was scheduled when the previous answer landed.
         self._cancel_dwell()
+        self._cancel_focus_collapse()
         self._arm_idle_timeout()
+        self._refresh_results()
+
+    # -- local results -----------------------------------------------------
+
+    def _refresh_results(self):
+        """Re-resolve locally on every keystroke. This is a pure-python match
+        over an in-memory index -- about 2ms -- so there is no debounce and
+        nothing leaves the machine."""
+        if self.state not in (LISTENING, RESPONDING, ERROR):
+            return
+        query = self.entry.get_text().strip()
+
+        if query:
+            # Cheap: returns immediately unless a search dir actually changed,
+            # so a newly installed app is findable without a restart.
+            self._index.refresh()
+            hits = launcher.resolve(
+                query, self._index, limit=self.config.get("max_results", 5)
+            )
+        else:
+            hits = []
+
+        # Hybrid routing: with nothing matched the card looks exactly as it
+        # always did and Enter goes to the model. The "Ask Ember" row is only
+        # added once there *are* offers, as the escape hatch that stops a good
+        # local match from trapping a question.
+        if hits:
+            hits = hits + [launcher.Result(
+                "ask", "Ask Ember", query, -1.0, {}, "system-search-symbolic"
+            )]
+
+        self._results = hits
+        self._sel = 0
+        self._render_rows()
+
+        showing_msg, showing_results = self._body_visibility()
+        self._show_widget(self._msg_scroll, showing_msg, True)
+        self._show_widget(self._results_scroll, showing_results, True)
+        self._animate_card(self.config["active_width"], self._content_height())
+
+    def _clear_rows(self):
+        for row in self.results.get_children():
+            self.results.remove(row)
+        self._rows = []
+
+    def _icon_for(self, result):
+        name = result.icon or "application-x-executable"
+        if name.startswith("/") and os.path.exists(name):
+            # Some entries name an icon file rather than a theme icon.
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(name, 22, 22)
+                return Gtk.Image.new_from_pixbuf(pixbuf)
+            except GLib.Error:
+                name = "application-x-executable"
+        image = Gtk.Image.new_from_icon_name(name, Gtk.IconSize.LARGE_TOOLBAR)
+        image.set_pixel_size(22)
+        return image
+
+    def _render_rows(self):
+        self._clear_rows()
+        for result in self._results:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            box.set_border_width(7)
+            box.pack_start(self._icon_for(result), False, False, 0)
+
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            title = Gtk.Label(xalign=0.0, label=result.title)
+            title.set_ellipsize(Pango.EllipsizeMode.END)
+            title.get_style_context().add_class("ember-row-title")
+            text.pack_start(title, False, False, 0)
+            if result.subtitle:
+                sub = Gtk.Label(xalign=0.0, label=result.subtitle)
+                sub.set_ellipsize(Pango.EllipsizeMode.END)
+                sub.get_style_context().add_class("ember-row-sub")
+                text.pack_start(sub, False, False, 0)
+            box.pack_start(text, True, True, 0)
+
+            row.add(box)
+            self.results.add(row)
+            self._rows.append((row, result))
+
+        self.results.show_all()
+        self._apply_selection()
+
+    def _apply_selection(self):
+        if not self._rows:
+            return
+        self._sel = max(0, min(self._sel, len(self._rows) - 1))
+        row = self._rows[self._sel][0]
+        self.results.select_row(row)
+        # Keep the highlighted row in view when the list is long enough to
+        # scroll; the entry holds focus, so the ListBox won't do this itself.
+        adjustment = self._results_scroll.get_vadjustment()
+        alloc = row.get_allocation()
+        # Straight after show_all() GTK has not laid out yet and reports a 1px
+        # allocation; scrolling on that would jump to nonsense.
+        if adjustment is not None and alloc.height > 1:
+            top, bottom = adjustment.get_value(), adjustment.get_value() + adjustment.get_page_size()
+            if alloc.y < top:
+                adjustment.set_value(alloc.y)
+            elif alloc.y + alloc.height > bottom:
+                adjustment.set_value(alloc.y + alloc.height - adjustment.get_page_size())
+
+    def _move_selection(self, delta):
+        if not self._rows:
+            return False
+        self._sel = (self._sel + delta) % len(self._rows)
+        self._apply_selection()
+        return True
+
+    def _on_row_activated(self, listbox, row):
+        for index, (candidate, _) in enumerate(self._rows):
+            if candidate is row:
+                self._sel = index
+                break
+        self._activate_selection()
+
+    def _activate_selection(self):
+        """Run the highlighted offer. Returns False when the caller should fall
+        through to the model instead."""
+        if not self._rows:
+            return False
+        result = self._rows[self._sel][1]
+
+        if result.kind == "ask":
+            return False
+        if result.kind == "calc":
+            # A calculation is already its own answer, so show it rather than
+            # collapsing to nothing and leaving the user wondering.
+            self.entry.set_text("")
+            self._results = []
+            self._clear_rows()
+            self.response_text = result.title
+            self.msg.set_text(result.title)
+            self.footer.set_text("copied to clipboard")
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(result.title, -1)
+            self._set_state(RESPONDING)
+            self._start_dwell(result.title)
+            return True
+
+        try:
+            launcher.activate(result)
+        except Exception as error:  # noqa: BLE001 - surfaced to the user below
+            self.entry.set_text("")
+            self._results = []
+            self._clear_rows()
+            self.response_text = f"Couldn't open that: {error}"
+            self.msg.set_text(self.response_text)
+            self._set_state(ERROR)
+            self._start_dwell(self.response_text)
+            return True
+
+        # Launching is the end of the interaction -- get out of the way.
+        self.entry.set_text("")
+        self._cancel_dwell()
+        self._set_state(IDLE)
+        return True
 
     def _open_input(self, initial_text=""):
         """Opens with a greeting already in place, so it reads as a
@@ -363,7 +644,9 @@ class Ember(Gtk.Window):
         # alone silently suppressed the greeting for up to 30 minutes after a
         # restart), or the previous session has aged out and won't be resumed.
         fresh = self.last_session_id is None or not self.runner._should_resume(cfg.load_state())
-        self.msg.set_text(cfg.pick_greeting() if fresh else "")
+        greeting = cfg.pick_greeting(name=self.config.get("user_name")) if fresh else ""
+        trace("greeting:", repr(greeting))
+        self.msg.set_text(greeting)
         self.footer.set_text("")
         self.response_text = ""
         self._set_state(LISTENING)
@@ -446,12 +729,36 @@ class Ember(Gtk.Window):
     def _on_focus_out(self, *_):
         # Clicking away should put it back to sleep. The menu takes focus while
         # it is open, so ignore that case or the widget collapses under it.
+        trace("focus-out state=", self.state, "raised=", self._raised)
         if self._menu_open or self.runner.busy:
             return False
         if self.state in (LISTENING, RESPONDING, ERROR):
+            self._arm_focus_collapse()
+        return False
+
+    def _on_focus_in(self, *_):
+        self._cancel_focus_collapse()
+        return False
+
+    def _arm_focus_collapse(self):
+        self._cancel_focus_collapse()
+        self._focus_collapse_id = GLib.timeout_add(
+            FOCUS_OUT_GRACE_MS, self._on_focus_collapse
+        )
+
+    def _cancel_focus_collapse(self):
+        if self._focus_collapse_id:
+            GLib.source_remove(self._focus_collapse_id)
+            self._focus_collapse_id = None
+
+    def _on_focus_collapse(self):
+        self._focus_collapse_id = None
+        # Re-check rather than trusting the event: focus may well have come
+        # straight back during the grace window.
+        if not self.has_toplevel_focus() and self.state in (LISTENING, RESPONDING, ERROR):
             self._cancel_dwell()
             self._set_state(IDLE)
-        return False
+        return GLib.SOURCE_REMOVE
 
     def _on_window_state(self, widget, event):
         # Ordinary minimise gestures iconify the window; Ember is meant to stay
@@ -491,14 +798,28 @@ class Ember(Gtk.Window):
 
     def _on_key(self, widget, event):
         key = Gdk.keyval_name(event.keyval)
+        control = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+
         if key == "Escape":
             self.runner.cancel()
             self._cancel_dwell()
             self._set_state(IDLE)
             return True
-        if key in ("t", "T") and event.state & Gdk.ModifierType.CONTROL_MASK:
+        if key in ("t", "T") and control:
             self._open_in_terminal()
             return True
+
+        if self._rows:
+            if key in ("Down", "Tab"):
+                return self._move_selection(1)
+            if key in ("Up", "ISO_Left_Tab"):
+                return self._move_selection(-1)
+            if key in ("Return", "KP_Enter") and control:
+                # Force the model past a confident local match, without having
+                # to arrow down to the Ask row.
+                self._ask_model(self.entry.get_text().strip())
+                return True
+
         if self.state == IDLE and event.string and event.string.isprintable():
             self._open_input(event.string)
             return True
@@ -577,7 +898,19 @@ class Ember(Gtk.Window):
         prompt = entry.get_text().strip()
         if not prompt or self.runner.busy:
             return
-        entry.set_text("")
+        # Whatever is highlighted wins. With no local offers there is nothing
+        # highlighted, so this falls straight through to the model exactly as
+        # it always did.
+        if self._activate_selection():
+            return
+        self._ask_model(prompt)
+
+    def _ask_model(self, prompt):
+        if not prompt or self.runner.busy:
+            return
+        self.entry.set_text("")
+        self._results = []
+        self._clear_rows()
         self.response_text = ""
         self.msg.set_text("")
         self.footer.set_text("")
@@ -691,12 +1024,81 @@ class Ember(Gtk.Window):
         return GLib.SOURCE_REMOVE
 
 
+    # -- summon ------------------------------------------------------------
+
+    def summon(self):
+        """Bring Ember up over whatever is on screen.
+
+        At rest it lives *below* the working windows, which is right for an
+        ambient widget and wrong for a hotkey command centre -- so the stacking
+        flips for exactly as long as it is open.
+        """
+        self._raised = True
+        self._cancel_focus_collapse()
+        self._apply_stacking()
+        self.deiconify()
+        self.present()
+        if self.state == IDLE:
+            self._open_input()
+        else:
+            self._arm_idle_timeout()
+        self.entry.grab_focus()
+        return GLib.SOURCE_REMOVE
+
+    def dismiss(self):
+        self._cancel_focus_collapse()
+        self.runner.cancel()
+        self._cancel_dwell()
+        self._set_state(IDLE)  # also clears the raise
+        return GLib.SOURCE_REMOVE
+
+    def toggle(self):
+        trace("toggle arrives, state=", self.state, "raised=", self._raised,
+              "pending_collapse=", self._focus_collapse_id is not None)
+        # A collapse still pending means Ember is open as far as the user is
+        # concerned -- that focus-out was the hotkey's own grab, not a click
+        # away -- so this press is a dismiss.
+        open_now = self.state != IDLE or self._focus_collapse_id is not None
+        self._cancel_focus_collapse()
+        return self.dismiss() if open_now else self.summon()
+
+    def on_ipc(self, message):
+        """Called on the IPC worker thread; hop to the GTK loop before touching
+        a single widget."""
+        GLib.idle_add(self._handle_ipc, message)
+
+    def _handle_ipc(self, message):
+        {
+            "toggle": self.toggle,
+            "show": self.summon,
+            "hide": self.dismiss,
+            "quit": Gtk.main_quit,
+        }.get(message, lambda: None)()
+        return GLib.SOURCE_REMOVE
+
+
 def main():
+    argv = sys.argv[1:]
+    wants_open = "--open" in argv or "--toggle" in argv
+
+    # Hand off to a running instance rather than starting a second widget.
+    if ipc.send("toggle" if wants_open else "ping"):
+        return 0
+
     widget = Ember()
     widget.show_all()
     widget._set_state(IDLE, animate=False)
+
+    if ipc.serve(widget.on_ipc) is None:
+        print("Ember is already running.", file=sys.stderr)
+        return 1
+    atexit.register(ipc.cleanup)
+
+    if wants_open:
+        GLib.idle_add(widget.summon)
     Gtk.main()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

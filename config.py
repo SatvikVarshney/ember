@@ -25,6 +25,10 @@ ACCENTS = {
 }
 
 DEFAULTS = {
+    # Used in greetings and handed to the model. Blank it and every greeting
+    # that would have used a name quietly drops out of the pool.
+    "user_name": "Satvik",
+
     "accent": "peach",
     "surface": "#EFE6D8",
     "font_family": "Quicksand",
@@ -48,6 +52,10 @@ DEFAULTS = {
 
     # How long an untouched empty input stays open before folding back.
     "listen_timeout_seconds": 20,
+
+    # Local offers shown before the "Ask Ember" row. Five is about the most
+    # that can be scanned without reading, which is the point of a launcher.
+    "max_results": 5,
 
     # None means "auto place bottom-center on first run".
     "x": None,
@@ -87,31 +95,53 @@ DEFAULTS = {
 
 # Shown in the same style as a real reply, not as grey placeholder text, so
 # opening the widget feels like someone already there rather than an empty form.
+#
+# Two rules learned by reading these on the actual desktop. They must not all be
+# questions -- a greeting that always ends in "what do you need?" puts the work
+# back on the person the moment they open it, which is what made the first set
+# read like a service desk. And they must vary in *shape*, not just wording;
+# five near-identical lines feel more scripted than three varied ones. Some just
+# signal presence and leave the silence open, which is the warmer thing to do.
+# Roughly a third of each pool uses the name. Every line carrying it would be
+# worse than none at all -- a name in every single greeting stops reading as
+# recognition and starts reading as a mail merge.
 GREETINGS = {
     "morning": [
-        "Morning. What do you need?",
-        "Morning — what can I get out of the way?",
-        "Morning. What're we doing?",
+        "Morning. What're we up to?",
+        "Morning — take your time.",
+        "Hey, morning. Where shall we start?",
+        "Morning. I'm here whenever.",
+        "Morning, {name}.",
+        "Morning, {name}. Good to see you.",
     ],
     "afternoon": [
-        "Hey. What do you need?",
-        "Afternoon. What can I do?",
-        "What're we sorting out?",
+        "Hey. How's it going?",
+        "Afternoon. What's on your mind?",
+        "Hey there. What're we up to?",
+        "Afternoon — I'm around.",
+        "Hey, {name}. Good to see you.",
+        "Afternoon, {name}. How's it going?",
     ],
     "evening": [
-        "Evening. What do you need?",
-        "Evening — what can I take care of?",
-        "Hey. What's left to do?",
+        "Evening. How was today?",
+        "Evening — what's on your mind?",
+        "Hey. Winding down, or still going?",
+        "Evening. I'm around.",
+        "Evening, {name}. How was today?",
+        "Hey {name}. No rush.",
     ],
     "night": [
-        "Still up? What do you need?",
-        "Late one. What can I do?",
-        "Hey. What do you need before bed?",
+        "Still up? I'm around.",
+        "Late one. What's on your mind?",
+        "Hey. No rush.",
+        "Still going? I'm here.",
+        "Still up, {name}?",
+        "Late one, {name}. What's keeping you up?",
     ],
 }
 
 
-def pick_greeting(now=None):
+def pick_greeting(now=None, name=None):
     import datetime
     import random
 
@@ -126,7 +156,14 @@ def pick_greeting(now=None):
         slot = "evening"
     else:
         slot = "night"
-    return random.choice(GREETINGS[slot])
+
+    name = (name or "").strip()
+    pool = GREETINGS[slot]
+    if not name:
+        # No name configured, so drop the lines that need one rather than
+        # rendering "Morning, ." at somebody.
+        pool = [line for line in pool if "{name}" not in line]
+    return random.choice(pool).format(name=name)
 
 
 def _read_json(path, fallback):
