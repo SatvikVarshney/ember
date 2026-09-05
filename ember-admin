@@ -1,0 +1,116 @@
+#!/bin/bash
+# ember-admin -- the single privileged entry point for the Ember widget.
+#
+# Installed to /usr/local/bin/ember-admin, root-owned, mode 755.
+# Granted passwordless via /etc/sudoers.d/ember, which names THIS EXACT PATH
+# and contains no wildcards. That matters: a sudoers rule like
+#   NOPASSWD: /usr/bin/apt install *
+# is trivially escaped with `apt -o APT::Update::Pre-Invoke::=/bin/sh`, so the
+# wrapper exists to keep globs out of sudoers entirely.
+#
+# SECURITY: this file must stay root-owned and NOT writable by the desktop
+# user. If the user (or anything running as them) can edit it, they can grant
+# themselves arbitrary root and the whole design is void.
+
+set -euo pipefail
+
+log() { logger -t ember-admin -- "$*" 2>/dev/null || true; }
+
+# Reject anything that could be read as an apt/dpkg option or a path. Without
+# this, "install" would accept -o/--option and become arbitrary code execution
+# as root, which is the exact failure mode the wrapper is here to prevent.
+validate_names() {
+    local name
+    for name in "$@"; do
+        case "$name" in
+            -*|*/*|*[[:space:]]*|"")
+                echo "refusing suspicious package name: $name" >&2
+                log "REJECTED package name: $name"
+                exit 2
+                ;;
+        esac
+        if ! [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9+._-]*$ ]]; then
+            echo "refusing suspicious package name: $name" >&2
+            log "REJECTED package name: $name"
+            exit 2
+        fi
+    done
+}
+
+usage() {
+    cat <<'EOF'
+ember-admin <command>
+
+  drop-caches           free page cache (cosmetic on Linux; rarely helps)
+  apt-update            refresh package lists
+  install <pkg>...      install packages
+  remove <pkg>...       remove packages
+  autoremove            remove orphaned dependencies
+  journal-vacuum        trim systemd journal to 200M
+  restart <service>     restart a systemd service
+EOF
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift || true
+
+case "$cmd" in
+    drop-caches)
+        sync
+        echo 3 > /proc/sys/vm/drop_caches
+        log "dropped caches"
+        echo "Page cache dropped."
+        ;;
+
+    apt-update)
+        log "apt update"
+        apt-get update -qq
+        echo "Package lists refreshed."
+        ;;
+
+    install)
+        [ $# -ge 1 ] || { echo "need at least one package name" >&2; exit 2; }
+        validate_names "$@"
+        log "install: $*"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+        echo "Installed: $*"
+        ;;
+
+    remove)
+        [ $# -ge 1 ] || { echo "need at least one package name" >&2; exit 2; }
+        validate_names "$@"
+        log "remove: $*"
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq "$@"
+        echo "Removed: $*"
+        ;;
+
+    autoremove)
+        log "autoremove"
+        DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -qq
+        echo "Orphaned packages removed."
+        ;;
+
+    journal-vacuum)
+        log "journal vacuum"
+        journalctl --vacuum-size=200M >/dev/null 2>&1
+        echo "Journal trimmed to 200M."
+        ;;
+
+    restart)
+        [ $# -eq 1 ] || { echo "need exactly one service name" >&2; exit 2; }
+        validate_names "$1"
+        log "restart service: $1"
+        systemctl restart "$1"
+        echo "Restarted $1."
+        ;;
+
+    ""|-h|--help|help)
+        usage
+        ;;
+
+    *)
+        echo "unknown command: $cmd" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+# Dedicated cwd for the agent; its contents are runtime scratch
+workspace/*
+!workspace/.gitkeep
