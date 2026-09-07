@@ -50,8 +50,9 @@ Looking things up:
 
 Admin things (installing, removing, system maintenance):
 - Everything privileged goes through one helper: `sudo ember-admin <command>`. It needs no password.
-- Commands: `apt-update`, `install <pkg>...`, `remove <pkg>...`, `autoremove`, `drop-caches`, `journal-vacuum`, `restart <service>`.
+- Commands: `apt-update`, `install <pkg>...`, `reinstall <pkg>...`, `remove <pkg>...`, `autoremove`, `drop-caches`, `journal-vacuum`, `restart <service>`.
 - So installing something is `sudo ember-admin install ripgrep`. Run `sudo ember-admin apt-update` first if a package isn't found.
+- To reinstall something, use `reinstall` -- never a `remove` followed by an `install`. Those are two commands with a gap in between, and if anything ends your turn in that gap the package is left uninstalled. `reinstall` does it in one step that cannot be interrupted half-done.
 - Plain `sudo <anything else>` will not work and isn't worth trying -- the helper is the only privileged route you have.
 - If someone asks to free up RAM, you can run `drop-caches`, but say honestly that Linux uses spare memory as cache on purpose and this mostly just makes the number look nicer.
 
@@ -90,7 +91,17 @@ _ESCALATE_PATTERNS = [
     re.compile(r"[\s,]+(?:use|with|using)\s+sonnet\s*$", re.I),
 ]
 
-CALL_TIMEOUT_SECONDS = 90
+# Idle time before a run is presumed hung, measured from the last line of
+# stream output rather than from the start of the call.
+#
+# It used to be a flat 90s cap on the whole call, which quietly broke any real
+# work: `apt-get install` on a big package outruns 90 seconds on its own, so the
+# watchdog killed the run mid-chain and left half-applied system changes behind.
+# Total duration is not evidence of a hang -- silence is. The window has to
+# clear the CLI's own Bash timeout (120s by default) or it would fire while a
+# legitimately slow command was still running.
+STALL_TIMEOUT_SECONDS = 240
+WATCHDOG_POLL_SECONDS = 5.0
 
 
 def build_persona(config):
@@ -188,6 +199,20 @@ class EmberRunner:
         if process and process.poll() is None:
             process.terminate()
 
+    def _watch(self, process, deadline, stop):
+        """Kill the run only after STALL_TIMEOUT_SECONDS of complete silence.
+
+        Polls rather than re-arming a Timer per line: a streamed reply is
+        hundreds of lines, and churning a thread for each one to move a deadline
+        a few seconds is pure waste.
+        """
+        while not stop.wait(WATCHDOG_POLL_SECONDS):
+            if process.poll() is not None:
+                return
+            if time.monotonic() > deadline[0]:
+                self.cancel()
+                return
+
     def run(self, prompt, on_event):
         """Blocking; run this on a worker thread.
 
@@ -244,8 +269,13 @@ class EmberRunner:
         except (BrokenPipeError, OSError):
             pass
 
-        watchdog = threading.Timer(CALL_TIMEOUT_SECONDS, self.cancel)
-        watchdog.daemon = True
+        # Single-slot list so the reader loop below can push the deadline out
+        # without the watchdog thread and it sharing a lock.
+        deadline = [time.monotonic() + STALL_TIMEOUT_SECONDS]
+        stop_watchdog = threading.Event()
+        watchdog = threading.Thread(
+            target=self._watch, args=(process, deadline, stop_watchdog), daemon=True
+        )
         watchdog.start()
 
         text_blocks = set()
@@ -254,6 +284,9 @@ class EmberRunner:
 
         try:
             for line in process.stdout:
+                # Any output at all is proof of life, so the stall clock
+                # restarts here and nowhere else.
+                deadline[0] = time.monotonic() + STALL_TIMEOUT_SECONDS
                 line = line.strip()
                 if not line:
                     continue
@@ -318,7 +351,7 @@ class EmberRunner:
                         })
                     emitted_done = True
         finally:
-            watchdog.cancel()
+            stop_watchdog.set()
 
         stderr = ""
         try:

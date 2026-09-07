@@ -44,6 +44,8 @@ ember-admin <command>
   drop-caches           free page cache (cosmetic on Linux; rarely helps)
   apt-update            refresh package lists
   install <pkg>...      install packages
+  reinstall <pkg>...    reinstall packages (one apt transaction, never
+                        leaves them removed if the install half fails)
   remove <pkg>...       remove packages
   autoremove            remove orphaned dependencies
   journal-vacuum        trim systemd journal to 200M
@@ -74,6 +76,24 @@ case "$cmd" in
         log "install: $*"
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
         echo "Installed: $*"
+        ;;
+
+    reinstall)
+        # Exists so the model never has to express "reinstall X" as a remove
+        # followed by a separate install. Two calls have a gap between them, and
+        # anything that ends the run in that gap -- the widget closing, a
+        # watchdog, a crash -- leaves the package uninstalled. That happened
+        # once with brave-browser. apt does this as a single transaction, so
+        # there is no gap to be interrupted in.
+        [ $# -ge 1 ] || { echo "need at least one package name" >&2; exit 2; }
+        validate_names "$@"
+        log "reinstall: $*"
+        # --reinstall only applies to a package that is currently installed;
+        # falling back to a plain install covers the removed and never-installed
+        # cases so "reinstall" means the same thing to the caller either way.
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --reinstall "$@" \
+            || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+        echo "Reinstalled: $*"
         ;;
 
     remove)

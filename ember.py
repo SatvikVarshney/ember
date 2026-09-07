@@ -64,6 +64,29 @@ MAX_RESULTS_H = 260
 # toggle land first and be read as the dismiss it is.
 FOCUS_OUT_GRACE_MS = 140
 
+# A run is not interruptible by accident. The model chains real commands --
+# `apt remove` followed by `apt install` is two calls, and dying between them
+# leaves the machine worse off than never having asked. So the first Escape
+# only warns, and a second within this window actually stops it.
+FORCE_CANCEL_MS = 3000
+
+# Cadence of the "working…" ellipsis. Slow enough to read as breathing rather
+# than as a spinner.
+ELLIPSIS_MS = 420
+
+# What a tool call is doing, in the widget's own voice. Anything unlisted just
+# says "working", which is honest and short.
+TOOL_ACTIVITY = {
+    "Bash": "running a command",
+    "WebSearch": "searching the web",
+    "WebFetch": "reading a page",
+    "Read": "reading a file",
+    "Write": "writing a file",
+    "Edit": "editing a file",
+    "Glob": "looking around",
+    "Grep": "looking around",
+}
+
 
 def ease_out_cubic(t):
     return 1 - pow(1 - t, 3)
@@ -105,6 +128,14 @@ class Ember(Gtk.Window):
         self._sel = 0
         self._raised = False
         self._focus_collapse_id = None
+
+        # Progress and the interrupt guard. `_activity` is the verb currently
+        # under the dot; `_force_cancel_id` is live only in the seconds after a
+        # first Escape, and its existence is what makes the second one bite.
+        self._activity = ""
+        self._ellipsis_id = None
+        self._ellipsis_step = 0
+        self._force_cancel_id = None
 
         self._build_window()
         self._build_ui()
@@ -367,6 +398,69 @@ class Ember(Gtk.Window):
             self.dot.queue_draw()
         return GLib.SOURCE_CONTINUE
 
+    # -- interrupt guard ---------------------------------------------------
+
+    @property
+    def busy_working(self):
+        """True while a run is in flight and must not be killed by a stray
+        keypress, click or hotkey.
+
+        Both halves matter. `runner.busy` is the authority, but it is cleared on
+        the worker thread, so between the subprocess ending and the `done` event
+        reaching the GTK loop there is a window where the state is still THINKING
+        and the reply has not been shown yet."""
+        return self.runner.busy or self.state == THINKING
+
+    def _arm_force_cancel(self):
+        self._cancel_force_cancel()
+        self._force_cancel_id = GLib.timeout_add(FORCE_CANCEL_MS, self._on_force_cancel_lapse)
+        self._paint_activity()
+
+    def _cancel_force_cancel(self):
+        if self._force_cancel_id is not None:
+            GLib.source_remove(self._force_cancel_id)
+            self._force_cancel_id = None
+
+    def _on_force_cancel_lapse(self):
+        self._force_cancel_id = None
+        if self.state == THINKING:
+            self._paint_activity()  # back to the plain activity line
+        return GLib.SOURCE_REMOVE
+
+    # -- activity line -----------------------------------------------------
+
+    def _start_ellipsis(self):
+        if self._ellipsis_id is None:
+            self._ellipsis_step = 0
+            self._ellipsis_id = GLib.timeout_add(ELLIPSIS_MS, self._on_ellipsis_tick)
+        self._paint_activity()
+
+    def _stop_ellipsis(self):
+        if self._ellipsis_id is not None:
+            GLib.source_remove(self._ellipsis_id)
+            self._ellipsis_id = None
+
+    def _on_ellipsis_tick(self):
+        if self.state != THINKING:
+            self._ellipsis_id = None
+            return GLib.SOURCE_REMOVE
+        self._ellipsis_step += 1
+        self._paint_activity()
+        return GLib.SOURCE_CONTINUE
+
+    def _paint_activity(self):
+        """The card's one honest signal that something is still happening.
+
+        A pending force-cancel takes the line over: if the user has already
+        pressed Escape once, telling them how to actually stop matters more
+        than telling them what is running.
+        """
+        if self._force_cancel_id is not None:
+            self.footer.set_text("still working — esc again to stop")
+            return
+        dots = "." * (1 + self._ellipsis_step % 3)
+        self.footer.set_text(f"{self._activity or 'working'}{dots}")
+
     # -- state machine -----------------------------------------------------
 
     def _target_geometry(self):
@@ -374,7 +468,10 @@ class Ember(Gtk.Window):
         if self.state == IDLE:
             return c["idle_width"], c["idle_height"]
         if self.state == THINKING:
-            return c["active_width"], c["response_height"]
+            # Follows content now that the activity line sits under the dot --
+            # a fixed height clipped the one piece of text that says work is
+            # still happening.
+            return c["active_width"], max(c["response_height"], self._content_height())
         # Height follows content so the input card isn't padded with dead space.
         return c["active_width"], self._content_height()
 
@@ -384,6 +481,11 @@ class Ember(Gtk.Window):
         # a dead gap under the text.
         extra = 40  # _inner border top+bottom
         body = 0
+
+        if self.dot.get_visible():
+            # Only THINKING shows the dot inside a full-width card; at rest the
+            # geometry is the fixed idle box, so this term never applies there.
+            body += self.dot.get_preferred_height()[1]
 
         if self._msg_scroll.get_visible():
             # Height must be computed *for the known width*: a wrapping label
@@ -438,7 +540,10 @@ class Ember(Gtk.Window):
             self._clear_rows()
 
         showing_input = state in (LISTENING, RESPONDING, ERROR)
-        showing_footer = state in (RESPONDING, ERROR)
+        # THINKING included: the footer is the only thing on the card that says
+        # work is still in flight, and without it a long tool chain looks
+        # identical to a hang.
+        showing_footer = state in (THINKING, RESPONDING, ERROR)
         showing_dot = state in (IDLE, THINKING)
         showing_msg, showing_results = self._body_visibility()
 
@@ -453,6 +558,15 @@ class Ember(Gtk.Window):
 
         self._inner.set_border_width(0 if state == IDLE else 20)
         self._update_opacity()
+
+        if state == THINKING:
+            self._start_ellipsis()
+        else:
+            self._stop_ellipsis()
+        if state != THINKING:
+            # Leaving THINKING means the run is over one way or another, so a
+            # half-armed "press again to stop" must not survive into the reply.
+            self._cancel_force_cancel()
 
         # Any route back to rest also drops the hotkey raise, so Ember can
         # never get stranded above the working windows.
@@ -730,7 +844,7 @@ class Ember(Gtk.Window):
         # Clicking away should put it back to sleep. The menu takes focus while
         # it is open, so ignore that case or the widget collapses under it.
         trace("focus-out state=", self.state, "raised=", self._raised)
-        if self._menu_open or self.runner.busy:
+        if self._menu_open or self.busy_working:
             return False
         if self.state in (LISTENING, RESPONDING, ERROR):
             self._arm_focus_collapse()
@@ -801,7 +915,12 @@ class Ember(Gtk.Window):
         control = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
 
         if key == "Escape":
+            if self.busy_working and self._force_cancel_id is None:
+                # First press during a run: warn, don't kill. See FORCE_CANCEL_MS.
+                self._arm_force_cancel()
+                return True
             self.runner.cancel()
+            self._cancel_force_cancel()
             self._cancel_dwell()
             self._set_state(IDLE)
             return True
@@ -849,6 +968,9 @@ class Ember(Gtk.Window):
 
         menu.append(Gtk.SeparatorMenuItem())
         quit_item = Gtk.MenuItem(label="Quit")
+        # Quitting takes the subprocess down with it, so it is off the table for
+        # the same reason dismissing is.
+        quit_item.set_sensitive(not self.busy_working)
         quit_item.connect("activate", lambda *_: Gtk.main_quit())
         menu.append(quit_item)
 
@@ -914,6 +1036,7 @@ class Ember(Gtk.Window):
         self.response_text = ""
         self.msg.set_text("")
         self.footer.set_text("")
+        self._activity = ""
         self._set_state(THINKING)
 
         thread = threading.Thread(target=self.runner.run, args=(prompt, self._emit), daemon=True)
@@ -932,7 +1055,8 @@ class Ember(Gtk.Window):
 
         elif kind == "tool":
             if self.state == THINKING:
-                self.footer.set_text("checking…")
+                self._activity = TOOL_ACTIVITY.get(event.get("name"), "working")
+                self._paint_activity()
 
         elif kind == "text":
             if self.state != RESPONDING:
@@ -1047,6 +1171,15 @@ class Ember(Gtk.Window):
 
     def dismiss(self):
         self._cancel_focus_collapse()
+        if self.busy_working:
+            # Closing mid-run once left a machine with brave-browser removed and
+            # never reinstalled: the model had run the remove and was killed
+            # before the install. Nothing that closes the card may end a run --
+            # only a deliberate double Escape can.
+            self.present()
+            self.entry.grab_focus()
+            self._arm_force_cancel()
+            return GLib.SOURCE_REMOVE
         self.runner.cancel()
         self._cancel_dwell()
         self._set_state(IDLE)  # also clears the raise
