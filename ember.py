@@ -1811,8 +1811,14 @@ class Ember(Gtk.Window):
             text = (event.get("text") or "").strip()
             if self._turn is not None and not any(
                     p["kind"] == "text" and p["text"].strip() for p in self._turn["record"]["parts"]):
-                # Nothing streamed (or only steps did): fall back to the result.
-                self._turn_text(text or "Done.")
+                # Nothing streamed. After steps, "Done." is honest; with no
+                # steps at all, an empty reply is a fault and must not be
+                # dressed up as success.
+                did_work = any(p["kind"] == "steps" for p in self._turn["record"]["parts"])
+                if text or did_work:
+                    self._turn_text(text or "Done.")
+                else:
+                    self._turn_note("No reply came back — try asking again.")
             self.response_text = text
             self._end_turn()
             # Folded mid-run (say, by launching an app from the list): the

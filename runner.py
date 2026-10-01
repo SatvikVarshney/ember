@@ -9,6 +9,7 @@ one. Idle sessions need no cleanup -- they simply stop being referenced.
 """
 
 import json
+import os
 import re
 import subprocess
 import threading
@@ -64,6 +65,11 @@ Admin things (installing, removing, system maintenance):
 - Plain `sudo <anything else>` will not work and isn't worth trying -- the helper is the only privileged route you have.
 - If someone asks to free up RAM, you can run `drop-caches`, but say honestly that Linux uses spare memory as cache on purpose and this mostly just makes the number look nicer.
 
+Long-running jobs (big downloads, batch installs, builds):
+- A single command can run for up to 10 minutes; give it `timeout` accordingly and just wait for it. That's the simple case and usually the right one.
+- Anything longer: start it detached so it survives your turn ending -- `setsid nohup <command> > ~/.cache/ember-job.log 2>&1 & echo $! > ~/.cache/ember-job.pid` -- tell them it's running, and check on it when they ask (`kill -0 $(cat ~/.cache/ember-job.pid)` and the log).
+- Never wait with `pgrep -f <pattern>` in a loop: the waiting command's own command line contains the pattern, so it matches itself and never ends. Wait on a PID (`while kill -0 <pid>; do sleep 3; done`) instead.
+
 Being useful:
 - Small desktop actions and quick questions are your job: apps, volume, brightness, windows, media, disk, memory, network, bluetooth.
 - Actually go and check rather than guessing.
@@ -117,9 +123,10 @@ _MODEL_PATTERNS = [
 # work: `apt-get install` on a big package outruns 90 seconds on its own, so the
 # watchdog killed the run mid-chain and left half-applied system changes behind.
 # Total duration is not evidence of a hang -- silence is. The window has to
-# clear the CLI's own Bash timeout (120s by default) or it would fire while a
-# legitimately slow command was still running.
-STALL_TIMEOUT_SECONDS = 240
+# clear the CLI's own Bash timeout or it would fire while a legitimately slow
+# command was still running -- and the model may raise that timeout to 600s
+# per command, which a 240s window here cut off mid-wait.
+STALL_TIMEOUT_SECONDS = 660
 WATCHDOG_POLL_SECONDS = 5.0
 
 
@@ -300,6 +307,15 @@ class EmberRunner:
                 cwd=str(cfg.WORKSPACE),
                 text=True,
                 bufsize=1,
+                env=dict(
+                    os.environ,
+                    # Each turn is a one-shot process. A backgrounded command
+                    # is stopped when that process exits, and the
+                    # "task stopped" notice then hijacks the next turn into an
+                    # empty reply -- the "Done." that meant nothing. Long jobs
+                    # are detached explicitly instead (see the persona).
+                    CLAUDE_CODE_DISABLE_BACKGROUND_TASKS="1",
+                ),
             )
         except (OSError, ValueError) as error:
             on_event({"type": "error", "message": f"Couldn't start: {error}"})
@@ -325,7 +341,10 @@ class EmberRunner:
 
         text_blocks = set()
         segments = []
-        emitted_done = False
+        # The CLI can emit more than one `result` in a single process (a queued
+        # notification gets its own empty one), so the last one wins and the
+        # turn is only over at end of stream.
+        final_result = None
         # What the turn actually did, for the usage tracker. The shell commands
         # are the valuable part: knowing a request recurs is not enough to
         # replace it with a local handler, knowing it always ends in the same
@@ -427,27 +446,9 @@ class EmberRunner:
                 elif kind == "result":
                     denials = event.get("permission_denials") or []
                     if denials:
-                        how["denied"] = [d.get("tool_name") for d in denials]
+                        how["denied"] = (how.get("denied") or []) + [d.get("tool_name") for d in denials]
                         on_event({"type": "denied", "denials": denials})
-
-                    # `result` is only the last text block; the whole reply,
-                    # narration included, is what was actually said.
-                    final = "\n\n".join(p for p in segments if p.strip()) or event.get("result") or ""
-                    if event.get("is_error"):
-                        on_event({"type": "error", "message": event.get("result") or final or "That didn't work.",
-                                  "how": how})
-                    else:
-                        on_event({
-                            "type": "done",
-                            "text": strip_markdown(final),
-                            "duration_ms": event.get("duration_ms"),
-                            "ttft_ms": event.get("ttft_ms"),
-                            "session_id": state["session_id"],
-                            "how": how,
-                            "cost_usd": event.get("total_cost_usd"),
-                            "num_turns": event.get("num_turns"),
-                        })
-                    emitted_done = True
+                    final_result = event
         finally:
             stop_watchdog.set()
 
@@ -458,7 +459,26 @@ class EmberRunner:
             pass
         process.wait()
 
-        if not emitted_done:
+        if final_result is not None:
+            event = final_result
+            # `result` is only the last text block; the whole reply,
+            # narration included, is what was actually said.
+            final = "\n\n".join(p for p in segments if p.strip()) or event.get("result") or ""
+            if event.get("is_error"):
+                on_event({"type": "error", "message": event.get("result") or final or "That didn't work.",
+                          "how": how})
+            else:
+                on_event({
+                    "type": "done",
+                    "text": strip_markdown(final),
+                    "duration_ms": event.get("duration_ms"),
+                    "ttft_ms": event.get("ttft_ms"),
+                    "session_id": state["session_id"],
+                    "how": how,
+                    "cost_usd": event.get("total_cost_usd"),
+                    "num_turns": event.get("num_turns"),
+                })
+        else:
             if process.returncode and process.returncode < 0:
                 on_event({"type": "error", "message": "That took too long, so I stopped.", "how": how})
             else:
