@@ -12,8 +12,32 @@ APP_DIR = pathlib.Path(__file__).resolve().parent
 CONFIG_DIR = pathlib.Path(os.path.expanduser("~/.config/ember"))
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_PATH = CONFIG_DIR / "state.json"
+# Appended to by tracker.py; read by `python3 tracker.py report`.
+HISTORY_PATH = CONFIG_DIR / "history.jsonl"
+# The visible conversation. Kept apart from state.json because the runner
+# rewrites that file at the end of every turn from a copy it read at the start,
+# which would silently drop anything the UI wrote in between.
+TRANSCRIPT_PATH = CONFIG_DIR / "transcript.json"
 WORKSPACE = APP_DIR / "workspace"
 SETTINGS_PATH = APP_DIR / "settings.json"
+
+# The models on offer, cheapest first. `alias` is what the CLI takes; the CLI
+# resolves each to the newest model of that family. The UI never shows model
+# names -- each one is a mood instead, which says more about when to pick it.
+MODELS = [
+    {"alias": "haiku", "label": "Off the cuff", "blurb": "first thought, best thought"},
+    {"alias": "sonnet", "label": "Thinking cap", "blurb": "the usual"},
+    {"alias": "opus", "label": "Sleeves rolled up", "blurb": "for the stubborn stuff"},
+    {"alias": "fable", "label": "Slow burn", "blurb": "go put the kettle on"},
+]
+
+
+def model_label(alias):
+    for model in MODELS:
+        if model["alias"] == alias:
+            return model["label"]
+    return (alias or "").capitalize()
+
 
 # Warm pastels. `dot` is the accent itself, `text` is the darker sibling used
 # for body copy so it stays readable on the cream surface.
@@ -57,9 +81,11 @@ DEFAULTS = {
     # that can be scanned without reading, which is the point of a launcher.
     "max_results": 5,
 
-    # None means "auto place bottom-center on first run".
-    "x": None,
-    "y": None,
+    # Where the resting dot sits on screen (its centre). None means "auto
+    # place bottom-centre on first run". Stored as the dot rather than the
+    # window corner so the canvas can change size without the dot moving.
+    "anchor_x": None,
+    "anchor_y": None,
 
     # Kept close to the dot: at rest the card is invisible, so a wide hit region
     # would swallow desktop clicks where the user can see nothing.
@@ -68,23 +94,48 @@ DEFAULTS = {
     "active_width": 560,
     "active_height": 124,
     "response_height": 96,
+    # Once a conversation starts the card widens into a chat panel. It grows
+    # with the transcript up to this height, then scrolls.
+    "chat_width": 700,
+    "chat_max_height": 760,
 
-    # Session rotation. The turn cap exists because resume latency grows with
-    # history -- without it the widget gets slower as the day goes on.
-    "session_idle_minutes": 30,
-    "session_max_turns": 12,
+    # Session rotation. Conversations used to be capped at 12 turns, which cut
+    # real troubleshooting off mid-thread; 0 means no cap, and Ctrl+N is the
+    # deliberate way to start over.
+    "session_idle_minutes": 90,
+    "session_max_turns": 0,
 
-    # Dwell before auto-collapse, scaled by response length so long answers
-    # aren't yanked away mid-read.
+    # Reopening within this window brings the conversation back on screen;
+    # after it, Ember opens as a plain launcher (the session still resumes if
+    # you ask something, and the old messages come back with it).
+    "chat_resume_minutes": 30,
+    # An open chat nobody has touched for this long folds back to the dot.
+    "chat_fold_minutes": 15,
+
+    # A reply that took longer than this, finishing while Ember isn't focused,
+    # raises a desktop notification -- long jobs are exactly the ones you
+    # wander off from.
+    "notify_after_seconds": 15,
+
+    # Dwell before auto-collapse for local results (calculator, errors in the
+    # launcher). Model replies never auto-collapse any more.
     "dwell_base_seconds": 3.5,
     "dwell_per_char_seconds": 0.035,
     "dwell_max_seconds": 14.0,
 
-    "model": "haiku",
-    "escalation_model": "sonnet",
-    # Haiku is fast, so spend the thinking budget -- low effort made it give up
-    # rather than go and look things up.
-    "effort": "high",
+    # Log every interaction to history.jsonl so usage can be reviewed and the
+    # frequent, deterministic requests moved off the model. Off means no record
+    # is written at all -- there is nothing to redact, because nothing is kept.
+    "track": True,
+
+    # Default model for a new conversation. Haiku proved too weak even for
+    # "small" jobs like Bluetooth pairing, so Sonnet is the floor; Haiku stays
+    # one keystroke away for the genuinely trivial.
+    "model": "sonnet",
+    # Per-model --effort. Haiku is fast, so spend the thinking budget -- low
+    # effort made it give up rather than go and look things up. Models not
+    # listed use the CLI default.
+    "effort": {"haiku": "high"},
 
     # Responses longer than this get the terminal handoff instead of trying to
     # cram them into a 420px pill.
@@ -182,11 +233,43 @@ def _write_json(path, data):
     os.replace(tmp, path)
 
 
+# Bumped when a saved value needs rewriting rather than just a new default.
+CONFIG_VERSION = 2
+
+
+def _migrate(saved):
+    """Bring an older config.json forward. Returns True when it changed."""
+    if saved.get("config_version", 1) >= CONFIG_VERSION:
+        return False
+    # v1 stored the canvas corner; the canvas was 620x560 then.
+    if saved.get("x") is not None and saved.get("y") is not None:
+        saved.setdefault("anchor_x", saved["x"] + 310)
+        saved.setdefault("anchor_y", saved["y"] + 280)
+    for key in ("x", "y", "escalation_model"):
+        saved.pop(key, None)
+    # v1 pinned Haiku and a 12-turn cap explicitly; both are what made longer
+    # conversations unusable, so they are reset rather than respected.
+    if saved.get("model") == "haiku":
+        saved["model"] = "sonnet"
+    if isinstance(saved.get("effort"), str):
+        saved["effort"] = {"haiku": saved["effort"]}
+    for key in ("session_max_turns", "session_idle_minutes"):
+        saved.pop(key, None)
+    saved["config_version"] = CONFIG_VERSION
+    return True
+
+
 def load_config():
     """Defaults merged with whatever the user has saved, so new keys in a
     future version don't break an existing config file."""
+    saved = _read_json(CONFIG_PATH, {})
+    if saved and _migrate(saved):
+        try:
+            _write_json(CONFIG_PATH, saved)
+        except OSError:
+            pass
     config = dict(DEFAULTS)
-    config.update(_read_json(CONFIG_PATH, {}))
+    config.update(saved)
     return config
 
 
@@ -200,6 +283,15 @@ def load_state():
 
 def save_state(state):
     _write_json(STATE_PATH, state)
+
+
+def load_transcript():
+    return _read_json(TRANSCRIPT_PATH, {"session_id": None, "messages": [], "model": None,
+                                        "updated_at": 0})
+
+
+def save_transcript(data):
+    _write_json(TRANSCRIPT_PATH, data)
 
 
 def accent_colors(config):

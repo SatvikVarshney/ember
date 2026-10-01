@@ -8,6 +8,13 @@ needed to sit on the desktop layer.
 The window itself never resizes. It is a fixed transparent canvas and the card
 inside it animates, which avoids janky window-manager resizes; an input shape
 region keeps clicks on the transparent area falling through to the desktop.
+
+Two views share the card. The *launcher* is the quick one: a greeting, the
+input and local results. The *chat* is a scrolling transcript -- it takes over
+as soon as a question goes to the model, survives the card being folded away,
+and only ends on Ctrl+N or when the session ages out. One-shot replies that
+vanished after a few seconds turned out to be the wrong shape: most real
+problems need a few rounds of back and forth.
 """
 
 import atexit
@@ -23,16 +30,20 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Pango", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
+gi.require_version("GdkX11", "3.0")
+from gi.repository import Gdk, GdkPixbuf, GdkX11, GLib, Gtk, Pango  # noqa: E402
 
 import cairo  # noqa: E402
 
 import config as cfg  # noqa: E402
 import ipc  # noqa: E402
 import launcher  # noqa: E402
-from runner import EmberRunner, strip_markdown  # noqa: E402
+import render  # noqa: E402
+import tracker  # noqa: E402
+from runner import EmberRunner, resolve_model, strip_markdown  # noqa: E402
 
-IDLE, LISTENING, THINKING, RESPONDING, ERROR = "idle", "listening", "thinking", "responding", "error"
+IDLE, LISTENING, THINKING, RESPONDING = "idle", "listening", "thinking", "responding"
+LAUNCHER, CHAT = "launcher", "chat"
 
 DEBUG = bool(os.environ.get("EMBER_DEBUG"))
 
@@ -41,41 +52,46 @@ def trace(*parts):
     if DEBUG:
         print(f"[{time.monotonic():9.3f}]", *parts, file=sys.stderr, flush=True)
 
-# The canvas is the fixed transparent window the card grows inside. It must be
-# comfortably taller than the tallest card, because _apply_card_size centres the
-# card -- anything larger than the canvas gets clipped at top and bottom.
-CANVAS_W, CANVAS_H = 620, 560
-MAX_CARD_H = 460
-# Where the resting dot sits, measured up from the bottom of the work area.
+# The canvas is the fixed transparent window the card grows inside. It is sized
+# for the tallest chat card, and the card is positioned around the resting
+# dot's anchor but clamped inside the canvas, so a tall card near the bottom of
+# the screen shifts up instead of being clipped.
+CANVAS_W, CANVAS_H_MAX = 780, 920
+LAUNCHER_MAX_H = 460
+# Where the resting dot sits on first run, measured up from the work-area bottom.
 DOT_ABOVE_BOTTOM = 150
 ANIM_MS = 16
-ANIM_DURATION = 0.34
+ANIM_DURATION = 0.30
+# Card padding (the inner box's border width).
+PAD = 20
 
-# Ceiling for the results list. Left deliberately short of MAX_CARD_H so the
-# entry and footer always have room -- the list scrolls rather than pushing
+# Ceiling for the results list. Left deliberately short of the card ceiling so
+# the entry and footer always have room -- the list scrolls rather than pushing
 # them out of the card.
 MAX_RESULTS_H = 260
 
-# Focus-out must not collapse the card instantly. Pressing the hotkey makes
-# gnome-shell take focus for its own key grab, and that fires focus-out about
-# 30ms BEFORE the toggle message arrives on the socket. Collapsing straight
-# away meant the toggle then found an idle widget and re-summoned it, so the
-# hotkey could open Ember but never close it. Deferring a few frames lets the
-# toggle land first and be read as the dismiss it is.
+# Messages kept on disk for the restored transcript. Old enough turns stop
+# mattering on screen long before they stop mattering to the session.
+TRANSCRIPT_KEEP = 80
+
+# Focus-out must not act instantly. Pressing the hotkey makes gnome-shell take
+# focus for its own key grab, and that fires focus-out about 30ms BEFORE the
+# toggle message arrives on the socket. Acting straight away meant the toggle
+# then found an idle widget and re-summoned it, so the hotkey could open Ember
+# but never close it. Deferring a few frames lets the toggle land first.
 FOCUS_OUT_GRACE_MS = 140
 
-# A run is not interruptible by accident. The model chains real commands --
-# `apt remove` followed by `apt install` is two calls, and dying between them
-# leaves the machine worse off than never having asked. So the first Escape
-# only warns, and a second within this window actually stops it.
+# A run is not interruptible by accident. The model chains real commands, and
+# dying between two of them can leave the machine worse off than never having
+# asked. So the first Escape only warns, and a second within this window stops.
 FORCE_CANCEL_MS = 3000
 
 # Cadence of the "working…" ellipsis. Slow enough to read as breathing rather
 # than as a spinner.
 ELLIPSIS_MS = 420
 
-# What a tool call is doing, in the widget's own voice. Anything unlisted just
-# says "working", which is honest and short.
+# What a tool call is doing, in the widget's own voice, for when the model gave
+# no description of its own.
 TOOL_ACTIVITY = {
     "Bash": "running a command",
     "WebSearch": "searching the web",
@@ -85,7 +101,12 @@ TOOL_ACTIVITY = {
     "Edit": "editing a file",
     "Glob": "looking around",
     "Grep": "looking around",
+    "ToolSearch": "getting ready",
 }
+
+
+def _ms_since(started):
+    return int((time.monotonic() - started) * 1000)
 
 
 def ease_out_cubic(t):
@@ -97,6 +118,151 @@ def hex_to_rgb(value):
     return tuple(int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))
 
 
+def _activity_from(step):
+    """A step's plain-language label: the model's own description when it gave
+    one ("List paired Bluetooth devices"), else a generic verb."""
+    text = (step.get("description") or "").strip().rstrip(".")
+    if not text:
+        return TOOL_ACTIVITY.get(step.get("name"), "working")
+    text = text[0].lower() + text[1:]
+    return text if len(text) <= 58 else text[:56].rstrip() + "…"
+
+
+def _steps_markup(items):
+    """The expanded body of a steps fold: what each step was for, and under it
+    the exact command, small and monospaced. Hidden until asked for."""
+    lines = []
+    for item in items:
+        desc = GLib.markup_escape_text(item.get("description") or TOOL_ACTIVITY.get(item.get("name"), item.get("name") or ""))
+        cmd = GLib.markup_escape_text(item.get("command") or "")
+        entry = desc
+        if cmd:
+            entry += f"\n<span font_family=\"monospace\" size=\"small\">{cmd}</span>"
+        lines.append(entry)
+    return "\n\n".join(lines)
+
+
+def _code_markup(code):
+    return f"<span font_family=\"monospace\" size=\"small\">{GLib.markup_escape_text(code)}</span>"
+
+
+def _wrap_label(markup="", css=None, selectable=True):
+    label = Gtk.Label(xalign=0.0, yalign=0.0)
+    label.set_line_wrap(True)
+    label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    label.set_markup(markup)
+    if selectable:
+        # Selectable so a reply can be copied, but never focusable: the entry
+        # has to keep the keyboard or typing a follow-up stops working.
+        label.set_selectable(True)
+        label.set_can_focus(False)
+    if css:
+        label.get_style_context().add_class(css)
+    return label
+
+
+class Chip(Gtk.EventBox):
+    """A small text button. EventBox rather than Gtk.Button so the theme's
+    button chrome never fights the card's look."""
+
+    def __init__(self, text, on_click, css="ember-chip"):
+        super().__init__()
+        self.set_visible_window(False)
+        self.label = Gtk.Label(label=text)
+        self.label.get_style_context().add_class(css)
+        self.add(self.label)
+        self.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+                        | Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect("enter-notify-event", lambda *_: self._hot(True))
+        self.connect("leave-notify-event", lambda *_: self._hot(False))
+        self.connect("button-press-event", self._on_press)
+        self._on_click = on_click
+
+    def _hot(self, on):
+        ctx = self.label.get_style_context()
+        ctx.add_class("hot") if on else ctx.remove_class("hot")
+        return False
+
+    def _on_press(self, widget, event):
+        if event.button == 1:
+            self._on_click(event)
+            return True
+        return False
+
+    def set_text(self, text):
+        self.label.set_text(text)
+
+
+class Fold(Gtk.Box):
+    """A quiet one-line summary that opens to show detail on click -- how
+    commands and code stay out of the conversation without being lost."""
+
+    def __init__(self, on_resize):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._on_resize = on_resize
+        self._open = False
+        self._title = ""
+        self.header = Chip("", self._toggle, css="ember-fold")
+        self.header.set_halign(Gtk.Align.START)
+        self.pack_start(self.header, False, False, 0)
+        self.body = _wrap_label(css="ember-fold-body")
+        self.revealer = Gtk.Revealer()
+        self.revealer.set_transition_type(Gtk.RevealerTransitionType.NONE)
+        self.revealer.add(self.body)
+        self.pack_start(self.revealer, False, False, 0)
+
+    def set_title(self, title):
+        self._title = title
+        self.header.set_text(("▾  " if self._open else "›  ") + title)
+
+    def set_body(self, markup):
+        self.body.set_markup(markup)
+
+    def _toggle(self, *_):
+        self._open = not self._open
+        self.revealer.set_reveal_child(self._open)
+        self.set_title(self._title)
+        self._on_resize()
+
+
+class Segment(Gtk.Box):
+    """One block of model text. Prose renders as markup; fenced code goes
+    behind a fold. Updated in place while it streams, rebuilt only when the
+    prose/code structure changes."""
+
+    def __init__(self, on_resize):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._on_resize = on_resize
+        self._kinds = []
+        self.raw = ""
+
+    def append(self, delta):
+        self.set_raw(self.raw + delta)
+
+    def set_raw(self, raw):
+        self.raw = raw
+        parts = render.pieces(raw)
+        kinds = [kind for kind, _ in parts]
+        if kinds != self._kinds:
+            for child in self.get_children():
+                self.remove(child)
+            for kind, _ in parts:
+                if kind == "prose":
+                    widget = _wrap_label(css="ember-text")
+                else:
+                    widget = Fold(self._on_resize)
+                self.pack_start(widget, False, False, 0)
+            self._kinds = kinds
+            self.show_all()
+        for widget, (kind, body) in zip(self.get_children(), parts):
+            if kind == "prose":
+                widget.set_markup(body)
+            else:
+                lines = body.count("\n") + 1
+                widget.set_title(f"code · {lines} line{'s' if lines != 1 else ''}")
+                widget.set_body(_code_markup(body))
+
+
 class Ember(Gtk.Window):
     def __init__(self):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
@@ -104,6 +270,7 @@ class Ember(Gtk.Window):
         self.runner = EmberRunner(self.config)
 
         self.state = IDLE
+        self.view = LAUNCHER
         self.hovered = False
         self.response_text = ""
         self.last_session_id = None
@@ -112,10 +279,16 @@ class Ember(Gtk.Window):
         self._anim_id = None
         self._dwell_id = None
         self._idle_timeout_id = None
+        self._fold_id = None
         self._menu_open = False
         self._pulse_phase = 0.0
         self._drag_origin = None
-        self._pending_model = self.config.get("model", "haiku")
+
+        # The model for the conversation on screen. Starts at the configured
+        # default; the chip, Alt+1-4, Ctrl+M or a "/opus" prefix change it, and
+        # it is saved with the transcript so a restored chat keeps its model.
+        self._model = self.config.get("model", "sonnet")
+        self._pending_model = self._model
 
         # Local resolution: the whole point is that "brave" or "vol 40" never
         # reaches a model. `_results` is what is currently on offer, `_rows`
@@ -129,13 +302,35 @@ class Ember(Gtk.Window):
         self._raised = False
         self._focus_collapse_id = None
 
-        # Progress and the interrupt guard. `_activity` is the verb currently
-        # under the dot; `_force_cancel_id` is live only in the seconds after a
-        # first Escape, and its existence is what makes the second one bite.
+        # Progress and the interrupt guard. `_activity` is the line in the
+        # footer while a run is going; `_force_cancel_id` is live only in the
+        # seconds after a first Escape, and its existence is what makes the
+        # second one bite.
         self._activity = ""
         self._ellipsis_id = None
         self._ellipsis_step = 0
         self._force_cancel_id = None
+
+        # The in-flight model turn, held open from _ask_model until whichever
+        # terminal event closes it. One slot rather than a stack because the
+        # runner refuses a second concurrent run anyway -- follow-ups typed
+        # meanwhile wait in `_queue` instead.
+        self._pending_turn = None
+        self._queue = []
+        # Bumped per run and on a forced stop, so the late events of a killed
+        # run can't land in the conversation that replaced it.
+        self._generation = 0
+
+        # The conversation: `_messages` is the saved record, `_turn` the reply
+        # being streamed right now.
+        saved = cfg.load_transcript()
+        self._messages = saved.get("messages") or []
+        self._transcript_session = saved.get("session_id")
+        self._transcript_model = saved.get("model")
+        self._transcript_at = saved.get("updated_at") or 0
+        self._chat_built = False
+        self._turn = None
+        self._stick_bottom = True
 
         self._build_window()
         self._build_ui()
@@ -148,15 +343,29 @@ class Ember(Gtk.Window):
 
     # -- window plumbing ---------------------------------------------------
 
+    def _workarea(self):
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        return monitor.get_workarea()
+
     def _build_window(self):
+        area = self._workarea()
+        self.canvas_w = min(CANVAS_W, area.width)
+        self.canvas_h = min(CANVAS_H_MAX, area.height)
+        # Card ceilings follow the canvas so nothing is ever clipped.
+        self.chat_max_h = min(self.config.get("chat_max_height", 760), self.canvas_h - 24)
+        self.launcher_max_h = min(LAUNCHER_MAX_H, self.chat_max_h)
+        # The dot's position inside the canvas; recomputed on placement.
+        self._anchor_in = (self.canvas_w // 2, self.canvas_h // 2)
+
         self.set_decorated(False)
         self.set_resizable(False)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
         self.set_accept_focus(True)
         self.set_app_paintable(True)
-        self.set_default_size(CANVAS_W, CANVAS_H)
-        self.set_size_request(CANVAS_W, CANVAS_H)
+        self.set_default_size(self.canvas_w, self.canvas_h)
+        self.set_size_request(self.canvas_w, self.canvas_h)
         self.set_type_hint({
             "desktop": Gdk.WindowTypeHint.DESKTOP,
             "dock": Gdk.WindowTypeHint.DOCK,
@@ -189,18 +398,22 @@ class Ember(Gtk.Window):
             self.set_keep_below(True)
 
     def _place_window(self):
-        x, y = self.config.get("x"), self.config.get("y")
-        if x is None or y is None:
-            display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor() or display.get_monitor(0)
-            area = monitor.get_workarea()
-            x = area.x + (area.width - CANVAS_W) // 2
-            # Position by where the *dot* should land, not the canvas edge: the
-            # card is centred in the canvas, so the canvas centre is the anchor.
-            # Sizing the canvas by the tallest card would otherwise drag the
-            # resting dot far up the screen.
-            y = area.y + area.height - DOT_ABOVE_BOTTOM - CANVAS_H // 2
+        """Put the canvas so the resting dot lands on its saved anchor, with the
+        canvas clamped on-screen. When clamping moves the canvas, the anchor's
+        position *inside* it moves instead, so the dot still sits where it was
+        left and the card simply has less room on that side."""
+        area = self._workarea()
+        ax, ay = self.config.get("anchor_x"), self.config.get("anchor_y")
+        if ax is None or ay is None:
+            ax = area.x + area.width // 2
+            ay = area.y + area.height - DOT_ABOVE_BOTTOM
+        x = max(area.x, min(ax - self.canvas_w // 2, area.x + area.width - self.canvas_w))
+        y = max(area.y, min(ay - self.canvas_h // 2, area.y + area.height - self.canvas_h))
+        self._anchor_in = (ax - x, ay - y)
         self.move(x, y)
+        alloc = self.card.get_allocation() if hasattr(self, "card") else None
+        if alloc and alloc.width > 1:
+            self._apply_card_size(alloc.width, alloc.height)
 
     # -- ui ----------------------------------------------------------------
 
@@ -225,7 +438,7 @@ class Ember(Gtk.Window):
         self.card.connect("motion-notify-event", self._on_motion)
         canvas.put(self.card, 0, 0)
 
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.card.add(inner)
         self._inner = inner
 
@@ -238,23 +451,28 @@ class Ember(Gtk.Window):
         self.dot.connect("draw", self._draw_dot)
         inner.pack_start(self.dot, True, True, 0)
 
-        # One label carries both the opening greeting and the reply, so the
-        # greeting reads as something said rather than as placeholder chrome.
-        self.msg = Gtk.Label(xalign=0.0, yalign=0.0)
-        self.msg.set_line_wrap(True)
-        self.msg.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        # Launcher view: one label carries the greeting (or a local result such
+        # as a calculation), so it reads as something said rather than as
+        # placeholder chrome.
+        self.msg = _wrap_label(css="ember-text", selectable=False)
         self.msg.set_max_width_chars(42)
-        self.msg.get_style_context().add_class("ember-text")
-
-        # Grows with the text up to a ceiling, then scrolls rather than
-        # overflowing the card and being clipped.
         self._msg_scroll = Gtk.ScrolledWindow()
         self._msg_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self._msg_scroll.set_propagate_natural_height(True)
-        self._msg_scroll.set_max_content_height(MAX_CARD_H - 110)
         self._msg_scroll.set_shadow_type(Gtk.ShadowType.NONE)
         self._msg_scroll.add(self.msg)
         inner.pack_start(self._msg_scroll, True, True, 0)
+
+        # Chat view: the transcript.
+        self.chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.chat_box.set_valign(Gtk.Align.END)
+        self._chat_scroll = Gtk.ScrolledWindow()
+        self._chat_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._chat_scroll.set_shadow_type(Gtk.ShadowType.NONE)
+        self._chat_scroll.add(self.chat_box)
+        adj = self._chat_scroll.get_vadjustment()
+        adj.connect("changed", self._on_chat_adj_changed)
+        adj.connect("value-changed", self._on_chat_scrolled)
+        inner.pack_start(self._chat_scroll, True, True, 0)
 
         self.entry = Gtk.Entry()
         self.entry.set_has_frame(False)
@@ -279,15 +497,39 @@ class Ember(Gtk.Window):
         self._results_scroll.add(self.results)
         inner.pack_start(self._results_scroll, False, False, 0)
 
-        self.footer = Gtk.Label(xalign=0.0)
-        self.footer.get_style_context().add_class("ember-footer")
+        # Footer: what's happening on the left, the conversation's controls on
+        # the right. The model chip is always there once the card is open, so
+        # picking the right model is one click rather than a phrase to recall.
+        self.footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.status = Gtk.Label(xalign=0.0)
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        self.status.get_style_context().add_class("ember-footer")
+        self.status_chip = Chip("", self._on_status_click, css="ember-footer")
+        self.status_chip.remove(self.status_chip.label)
+        self.status_chip.label = self.status
+        self.status_chip.add(self.status)
+        self.footer.pack_start(self.status_chip, True, True, 0)
+        self.new_chip = Chip("new chat", lambda *_: self._new_chat())
+        self.new_chip.set_tooltip_text("Start a fresh conversation (Ctrl+N)")
+        self.footer.pack_end(self.model_chip_box(), False, False, 0)
+        self.footer.pack_end(self.new_chip, False, False, 0)
         inner.pack_start(self.footer, False, False, 0)
+        self._status_action = None
+
+    def model_chip_box(self):
+        self.model_chip = Chip("", self._show_model_menu)
+        self.model_chip.set_tooltip_text(
+            "How hard to think about this chat — Alt+1–4 or Ctrl+M to switch")
+        self._paint_model_chip()
+        return self.model_chip
 
     def _apply_css(self):
         colors = cfg.accent_colors(self.config)
         surface = self.config["surface"]
         font = self.config["font_family"]
         size = self.config["font_size"]
+        text = colors["text"]
+        dot = colors["dot"]
         css = f"""
         window {{ background-color: transparent; }}
         .ember-card {{
@@ -303,29 +545,74 @@ class Ember(Gtk.Window):
             background: transparent;
             border: none;
             box-shadow: none;
-            color: {colors['text']};
+            color: {text};
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {size}px;
-            caret-color: {colors['text']};
+            caret-color: {text};
         }}
-        .ember-input placeholder {{ color: alpha({colors['text']}, 0.35); }}
+        .ember-input placeholder {{ color: alpha({text}, 0.35); }}
         .ember-card scrolledwindow,
         .ember-card viewport {{ background-color: transparent; }}
         .ember-card scrollbar {{ background-color: transparent; border: none; }}
         .ember-card scrollbar slider {{
-            background-color: alpha({colors['text']}, 0.25);
+            background-color: alpha({text}, 0.25);
             border: none;
             min-width: 5px;
         }}
         .ember-text {{
-            color: {colors['text']};
+            color: {text};
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {size}px;
         }}
+        .ember-text selection {{ background-color: alpha({dot}, 0.55); color: {text}; }}
+        /* Your side of the conversation: a soft tinted bubble on the right.
+           Ember's side is bare text -- it's the one talking. */
+        .ember-you {{
+            color: {text};
+            background-color: alpha({dot}, 0.30);
+            border-radius: 18px;
+            padding: 8px 15px;
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {size - 1}px;
+        }}
+        .ember-note {{
+            color: alpha({text}, 0.55);
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {max(12, size - 3)}px;
+            font-style: italic;
+        }}
+        .ember-fold {{
+            color: alpha({text}, 0.42);
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {max(11, size - 5)}px;
+            padding: 1px 8px 1px 2px;
+            border-radius: 9px;
+        }}
+        .ember-fold.hot {{ color: alpha({text}, 0.8); }}
+        .ember-fold-body {{
+            color: alpha({text}, 0.78);
+            background-color: alpha({text}, 0.06);
+            border-radius: 12px;
+            padding: 10px 14px;
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {max(11, size - 5)}px;
+        }}
         .ember-footer {{
-            color: alpha({colors['text']}, 0.45);
+            color: alpha({text}, 0.45);
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {max(11, size - 6)}px;
+        }}
+        .ember-footer.hot {{ color: alpha({text}, 0.75); }}
+        .ember-chip {{
+            color: alpha({text}, 0.55);
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {max(11, size - 6)}px;
+            padding: 3px 10px;
+            border-radius: 11px;
+        }}
+        .ember-chip.hot {{
+            color: {text};
+            background-color: alpha({dot}, 0.30);
         }}
         /* Rows have to sit inside the cream surface, not on top of it, so the
            list itself stays transparent and only the selection is painted. */
@@ -335,21 +622,22 @@ class Ember(Gtk.Window):
         }}
         .ember-results row {{ border-radius: 14px; }}
         .ember-results row:selected {{
-            background-color: alpha({colors['dot']}, 0.38);
+            background-color: alpha({dot}, 0.38);
         }}
         .ember-results row:hover {{
-            background-color: alpha({colors['dot']}, 0.18);
+            background-color: alpha({dot}, 0.18);
         }}
         .ember-row-title {{
-            color: {colors['text']};
+            color: {text};
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {max(13, size - 3)}px;
         }}
         .ember-row-sub {{
-            color: alpha({colors['text']}, 0.5);
+            color: alpha({text}, 0.5);
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {max(10, size - 7)}px;
         }}
+        tooltip {{ border-radius: 10px; }}
         """
         provider = Gtk.CssProvider()
         provider.load_from_data(css.encode())
@@ -366,8 +654,9 @@ class Ember(Gtk.Window):
         h = widget.get_allocated_height()
         cx, cy = w / 2, h / 2
 
-        if self.state in (IDLE, THINKING):
-            speed = 2.6 if self.state == IDLE else 0.85
+        if self.state == IDLE:
+            # Breathes quicker while a run is still going behind a folded card.
+            speed = 0.85 if self.runner.busy else 2.6
             phase = (math.sin(self._pulse_phase * (2 * math.pi) / speed) + 1) / 2
             scale = 0.78 + 0.22 * phase
             alpha = 0.6 + 0.4 * phase
@@ -393,7 +682,7 @@ class Ember(Gtk.Window):
         return False
 
     def _on_pulse_tick(self):
-        if self.state in (IDLE, THINKING):
+        if self.state == IDLE:
             self._pulse_phase += ANIM_MS / 1000.0
             self.dot.queue_draw()
         return GLib.SOURCE_CONTINUE
@@ -427,6 +716,19 @@ class Ember(Gtk.Window):
             self._paint_activity()  # back to the plain activity line
         return GLib.SOURCE_REMOVE
 
+    def _force_stop(self):
+        """The deliberate second Escape: kill the run, keep the conversation."""
+        self._close_turn("cancelled")
+        self._generation += 1
+        self.runner.cancel()
+        self._cancel_force_cancel()
+        dropped = len(self._queue)
+        self._queue = []
+        if self._turn is not None:
+            self._turn_note("Stopped." + (" Dropped what you queued." if dropped else ""))
+            self._end_turn()
+        self._set_state(LISTENING)
+
     # -- activity line -----------------------------------------------------
 
     def _start_ellipsis(self):
@@ -456,70 +758,78 @@ class Ember(Gtk.Window):
         than telling them what is running.
         """
         if self._force_cancel_id is not None:
-            self.footer.set_text("still working — esc again to stop")
+            self._set_status("still working — esc again to stop")
             return
         dots = "." * (1 + self._ellipsis_step % 3)
-        self.footer.set_text(f"{self._activity or 'working'}{dots}")
+        queued = f"  ·  {len(self._queue)} queued" if self._queue else ""
+        self._set_status(f"{self._activity or 'thinking'}{dots}{queued}")
+
+    def _set_status(self, text, action=None):
+        """Footer text. `action`, when given, makes it clickable."""
+        self.status.set_text(text)
+        self._status_action = action
+
+    def _on_status_click(self, *_):
+        if self._status_action:
+            self._status_action()
 
     # -- state machine -----------------------------------------------------
 
-    def _target_geometry(self):
-        c = self.config
+    def _card_width(self):
         if self.state == IDLE:
-            return c["idle_width"], c["idle_height"]
-        if self.state == THINKING:
-            # Follows content now that the activity line sits under the dot --
-            # a fixed height clipped the one piece of text that says work is
-            # still happening.
-            return c["active_width"], max(c["response_height"], self._content_height())
-        # Height follows content so the input card isn't padded with dead space.
-        return c["active_width"], self._content_height()
+            return self.config["idle_width"]
+        return self.config["chat_width"] if self.view == CHAT else self.config["active_width"]
+
+    def _target_geometry(self):
+        if self.state == IDLE:
+            return self.config["idle_width"], self.config["idle_height"]
+        return self._card_width(), self._content_height()
 
     def _content_height(self):
-        # _inner carries its own border width, so its natural height already
-        # includes the padding -- adding more here double-counts it and leaves
-        # a dead gap under the text.
-        extra = 40  # _inner border top+bottom
+        # _inner carries its own border width, so the padding is counted here
+        # once and only once -- double-counting it left a dead gap under the text.
+        extra = 2 * PAD
         body = 0
+        spacing = self._inner.get_spacing()
+        ceiling = self.chat_max_h if self.view == CHAT else self.launcher_max_h
+        width = self._card_width() - 2 * PAD
 
-        if self.dot.get_visible():
-            # Only THINKING shows the dot inside a full-width card; at rest the
-            # geometry is the fixed idle box, so this term never applies there.
-            body += self.dot.get_preferred_height()[1]
-
-        if self._msg_scroll.get_visible():
-            # Height must be computed *for the known width*: a wrapping label
-            # asked for its plain preferred height reports almost nothing,
-            # which left the card stuck at its minimum no matter how long the
-            # reply was.
-            width = self.config["active_width"] - 72
-            self.msg.set_size_request(width, -1)
-            _, text_h = self.msg.get_preferred_height_for_width(width)
-            visible_h = min(text_h, MAX_CARD_H - 110)
-            self._msg_scroll.set_size_request(-1, visible_h)
-            body += visible_h
-
+        if self.entry.get_visible():
+            extra += self.entry.get_preferred_height()[1] + spacing
+        if self.footer.get_visible():
+            extra += self.footer.get_preferred_height()[1] + spacing
         if self._results_scroll.get_visible():
             _, rows_h = self.results.get_preferred_height()
             rows_h = min(rows_h, MAX_RESULTS_H)
             self._results_scroll.set_size_request(-1, rows_h)
-            body += rows_h + 6
+            extra += rows_h + spacing
 
-        if self.entry.get_visible():
-            extra += self.entry.get_preferred_height()[1] + 6
-        if self.footer.get_visible():
-            extra += self.footer.get_preferred_height()[1] + 6
-        return max(72, min(body + extra, MAX_CARD_H))
+        room = max(40, ceiling - extra)
+        if self._msg_scroll.get_visible():
+            # Height must be computed *for the known width*: a wrapping label
+            # asked for its plain preferred height reports almost nothing.
+            self.msg.set_size_request(width, -1)
+            _, text_h = self.msg.get_preferred_height_for_width(width)
+            visible_h = min(text_h, room)
+            self._msg_scroll.set_size_request(-1, visible_h)
+            body += visible_h
+        if self._chat_scroll.get_visible():
+            _, chat_h = self.chat_box.get_preferred_height_for_width(width - 10)
+            visible_h = min(chat_h, room)
+            self._chat_scroll.set_size_request(-1, visible_h)
+            body += visible_h
+        return max(72, min(body + extra, ceiling))
 
     def _body_visibility(self):
-        """The greeting and the results list are mutually exclusive.
-
-        While the list is up the greeting would only push the rows further from
-        the input for no benefit, and the rows are the thing being read.
-        """
-        listing = self.state == LISTENING and bool(self._results)
-        showing_msg = self.state in (LISTENING, RESPONDING, ERROR) and not listing
-        return showing_msg, listing
+        """(greeting, transcript, results). The greeting and the results list
+        are mutually exclusive in the launcher: while the list is up the
+        greeting would only push the rows further from the input."""
+        if self.state == IDLE:
+            return False, False, False
+        listing = bool(self._results) and self.state in (LISTENING, RESPONDING, THINKING)
+        if self.view == CHAT:
+            return False, True, listing
+        return (self.state in (LISTENING, RESPONDING) and not listing), False, listing
 
     @staticmethod
     def _show_widget(widget, visible, deep=False):
@@ -528,68 +838,289 @@ class Ember(Gtk.Window):
         if visible:
             widget.show_all() if deep else widget.show()
 
+    def _relayout(self, animate=True):
+        showing_msg, showing_chat, showing_results = self._body_visibility()
+        self._show_widget(self._msg_scroll, showing_msg, True)
+        self._show_widget(self._chat_scroll, showing_chat, True)
+        self._show_widget(self._results_scroll, showing_results, True)
+        self._show_widget(self.new_chip, self.view == CHAT and self.state != THINKING, True)
+        self._animate_card(*self._target_geometry(), animate)
+
     def _set_state(self, state, animate=True):
-        self.state = state
-        # The input stays put after a reply so a follow-up is just typing --
-        # the conversation carries on in the same session rather than each
-        # exchange being a one-shot.
-        if state != LISTENING:
+        previous, self.state = self.state, state
+        if state not in (LISTENING, THINKING):
             # Offers belong to the query that produced them; carrying them into
             # a reply would leave stale rows under the answer.
             self._results = []
             self._clear_rows()
 
-        showing_input = state in (LISTENING, RESPONDING, ERROR)
-        # THINKING included: the footer is the only thing on the card that says
-        # work is still in flight, and without it a long tool chain looks
-        # identical to a hang.
-        showing_footer = state in (THINKING, RESPONDING, ERROR)
-        showing_dot = state in (IDLE, THINKING)
-        showing_msg, showing_results = self._body_visibility()
+        open_ = state != IDLE
+        self._show_widget(self.dot, not open_)
+        self._show_widget(self.entry, open_)
+        self._show_widget(self.footer, open_, True)
+        if self.view == CHAT and open_ and not self._chat_built:
+            self._rebuild_chat()
 
-        for widget, visible, deep in (
-            (self.dot, showing_dot, False),
-            (self._msg_scroll, showing_msg, True),
-            (self.entry, showing_input, False),
-            (self._results_scroll, showing_results, True),
-            (self.footer, showing_footer, False),
-        ):
-            self._show_widget(widget, visible, deep)
-
-        self._inner.set_border_width(0 if state == IDLE else 20)
+        self._inner.set_border_width(PAD if open_ else 0)
         self._update_opacity()
 
         if state == THINKING:
             self._start_ellipsis()
         else:
             self._stop_ellipsis()
-        if state != THINKING:
             # Leaving THINKING means the run is over one way or another, so a
             # half-armed "press again to stop" must not survive into the reply.
             self._cancel_force_cancel()
+            if previous == THINKING:
+                self._set_status("")
+            self._activity = ""
 
         # Any route back to rest also drops the hotkey raise, so Ember can
         # never get stranded above the working windows.
-        if state == IDLE and self._raised:
-            self._raised = False
-            self._apply_stacking()
+        if state == IDLE:
+            self._cancel_fold()
+            if self._raised:
+                self._raised = False
+                self._apply_stacking()
 
-        if showing_input:
+        if open_:
+            # In a chat the input sits under a wall of text; a faint prompt
+            # keeps it findable when the caret blinks off.
+            self.entry.set_placeholder_text(
+                "" if self.view == LAUNCHER else
+                "Add something — it'll go next" if state == THINKING else "Reply…")
             self.entry.grab_focus()
             self._arm_idle_timeout()
         else:
             self._cancel_idle_timeout()
 
-        w, h = self._target_geometry()
-        self._animate_card(w, h, animate)
+        self._relayout(animate)
 
     def _on_typing(self, *_):
-        # Starting a follow-up must not be cut off by the collapse timer that
-        # was scheduled when the previous answer landed.
+        # Starting a follow-up must not be cut off by any pending collapse.
         self._cancel_dwell()
         self._cancel_focus_collapse()
         self._arm_idle_timeout()
         self._refresh_results()
+
+    # -- conversation ------------------------------------------------------
+
+    def _chat_resumable(self):
+        """Whether reopening should bring the conversation back on screen."""
+        if not self._messages:
+            return False
+        recent = time.time() - self._transcript_at < self.config.get("chat_resume_minutes", 30) * 60
+        return recent and self.runner.will_resume()
+
+    def _save_transcript(self):
+        self._messages = self._messages[-TRANSCRIPT_KEEP:]
+        self._transcript_at = time.time()
+        self._transcript_model = self._model
+        try:
+            cfg.save_transcript({
+                "session_id": self.last_session_id or self._transcript_session,
+                "model": self._model,
+                "updated_at": self._transcript_at,
+                "messages": self._messages,
+            })
+        except OSError:
+            pass
+
+    def _new_chat(self):
+        if self.busy_working:
+            self._arm_force_cancel()
+            return
+        self.runner.new_session()
+        self._messages = []
+        self._transcript_session = None
+        self.last_session_id = None
+        self._save_transcript()
+        self._clear_chat()
+        self._model = self.config.get("model", "sonnet")
+        self._paint_model_chip()
+        self.view = LAUNCHER
+        self._open_input()
+
+    def _clear_chat(self):
+        for child in self.chat_box.get_children():
+            self.chat_box.remove(child)
+        self._turn = None
+        self._chat_built = False
+
+    def _rebuild_chat(self):
+        """Recreate the transcript widgets from the saved record."""
+        self._clear_chat()
+        for message in self._messages:
+            if message.get("role") == "you":
+                self._add_bubble(message.get("text", ""))
+            else:
+                self._add_reply(message)
+        self._chat_built = True
+        self._stick_bottom = True
+        self.chat_box.show_all()
+
+    def _add_bubble(self, text, queued=False):
+        label = _wrap_label(GLib.markup_escape_text(text), css="ember-you")
+        label.set_max_width_chars(38)
+        label.set_xalign(0.0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.pack_end(label, False, False, 0)
+        if queued:
+            row.set_opacity(0.55)
+        row.show_all()
+        self.chat_box.pack_start(row, False, False, 0)
+        self._stick_bottom = True
+        return row
+
+    def _add_reply(self, record):
+        """Widgets for one saved Ember turn."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for part in record.get("parts") or []:
+            self._part_widget(box, part)
+        box.show_all()
+        self.chat_box.pack_start(box, False, False, 0)
+        return box
+
+    def _part_widget(self, box, part):
+        kind = part.get("kind")
+        if kind == "text":
+            widget = Segment(self._on_chat_resize)
+            widget.set_raw(part.get("text", ""))
+        elif kind == "steps":
+            widget = Fold(self._on_chat_resize)
+            self._paint_steps(widget, part["items"])
+        else:
+            widget = _wrap_label(GLib.markup_escape_text(part.get("text", "")), css="ember-note")
+        box.pack_start(widget, False, False, 0)
+        widget.show_all()
+        return widget
+
+    @staticmethod
+    def _paint_steps(fold, items):
+        n = len(items)
+        fold.set_title(f"{n} step{'s' if n != 1 else ''}")
+        fold.set_body(_steps_markup(items))
+
+    def _begin_turn(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.show()
+        self.chat_box.pack_start(box, False, False, 0)
+        self._turn = {"box": box, "record": {"role": "ember", "parts": []}, "widgets": []}
+
+    def _turn_part(self, kind):
+        """The turn's current part of `kind`, starting a new one if the last
+        part is something else."""
+        turn = self._turn
+        parts = turn["record"]["parts"]
+        if parts and parts[-1]["kind"] == kind:
+            return parts[-1], turn["widgets"][-1]
+        part = {"kind": kind, "text": ""} if kind != "steps" else {"kind": "steps", "items": []}
+        parts.append(part)
+        widget = self._part_widget(turn["box"], part)
+        turn["widgets"].append(widget)
+        return part, widget
+
+    def _turn_text(self, delta):
+        part, widget = self._turn_part("text")
+        part["text"] += delta
+        widget.set_raw(part["text"])
+        self._on_chat_resize()
+
+    def _turn_segment(self):
+        # A fresh text block after a tool call. If the previous text part is
+        # still the last part (no step between), keep the two apart with a
+        # paragraph break rather than starting another widget.
+        parts = self._turn["record"]["parts"]
+        if parts and parts[-1]["kind"] == "text" and parts[-1]["text"].strip():
+            self._turn_text("\n\n")
+
+    def _turn_step(self, step):
+        part, widget = self._turn_part("steps")
+        part["items"].append({k: step.get(k, "") for k in ("name", "description", "command")})
+        self._paint_steps(widget, part["items"])
+        self._on_chat_resize()
+
+    def _turn_note(self, text):
+        if self._turn is None:
+            self._begin_turn()
+        part = {"kind": "note", "text": text}
+        self._turn["record"]["parts"].append(part)
+        self._turn["widgets"].append(self._part_widget(self._turn["box"], part))
+        self._on_chat_resize()
+
+    def _end_turn(self):
+        turn = self._turn
+        self._turn = None
+        if not turn:
+            return
+        record = turn["record"]
+        # Tidy the final text the same way the runner does, so a trailing
+        # "Sources:" list doesn't survive into the saved transcript.
+        for part, widget in zip(record["parts"], turn["widgets"]):
+            if part["kind"] == "text":
+                part["text"] = part["text"].strip()
+                widget.set_raw(part["text"])
+        if record["parts"]:
+            self._messages.append(record)
+        self._save_transcript()
+
+    def _on_chat_resize(self):
+        if self.state != IDLE and self.view == CHAT:
+            self._animate_card(self._card_width(), self._content_height())
+
+    def _on_chat_adj_changed(self, adj):
+        if self._stick_bottom:
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+
+    def _on_chat_scrolled(self, adj):
+        # Follow new text only while the reader is at the bottom; scrolling up
+        # to re-read something must not be yanked back down mid-sentence.
+        self._stick_bottom = adj.get_value() >= adj.get_upper() - adj.get_page_size() - 24
+
+    def _show_chat(self):
+        self.view = CHAT
+        self._model = self._transcript_model or self._model
+        self._paint_model_chip()
+        self._set_status("")
+        self._set_state(LISTENING)
+
+    # -- model choice ------------------------------------------------------
+
+    def _paint_model_chip(self):
+        if hasattr(self, "model_chip"):
+            self.model_chip.set_text(f"{cfg.model_label(self._model)}  ▾")
+
+    def _set_model(self, alias, announce=True):
+        self._model = alias
+        self._transcript_model = alias
+        self._paint_model_chip()
+        if announce and self.state != THINKING:
+            blurb = next((m["blurb"] for m in cfg.MODELS if m["alias"] == alias), "")
+            self._set_status(f"{cfg.model_label(alias)} — {blurb}")
+        if self._messages:
+            self._save_transcript()
+
+    def _cycle_model(self):
+        aliases = [m["alias"] for m in cfg.MODELS]
+        index = aliases.index(self._model) if self._model in aliases else 0
+        self._set_model(aliases[(index + 1) % len(aliases)])
+
+    def _show_model_menu(self, event):
+        menu = Gtk.Menu()
+        for number, model in enumerate(cfg.MODELS, 1):
+            item = Gtk.CheckMenuItem(label=f"{model['label']}  —  {model['blurb']}")
+            item.set_draw_as_radio(True)
+            item.set_active(model["alias"] == self._model)
+            item.connect("activate", lambda it, alias=model["alias"]:
+                         it.get_active() and self._set_model(alias))
+            menu.append(item)
+        self._popup(menu, event)
+
+    def _popup(self, menu, event):
+        self._menu_open = True
+        menu.connect("deactivate", self._on_menu_closed)
+        menu.show_all()
+        menu.popup_at_pointer(event)
 
     # -- local results -----------------------------------------------------
 
@@ -597,11 +1128,11 @@ class Ember(Gtk.Window):
         """Re-resolve locally on every keystroke. This is a pure-python match
         over an in-memory index -- about 2ms -- so there is no debounce and
         nothing leaves the machine."""
-        if self.state not in (LISTENING, RESPONDING, ERROR):
+        if self.state == IDLE:
             return
         query = self.entry.get_text().strip()
 
-        if query:
+        if query and not query.startswith("/"):
             # Cheap: returns immediately unless a search dir actually changed,
             # so a newly installed app is findable without a restart.
             self._index.refresh()
@@ -612,22 +1143,22 @@ class Ember(Gtk.Window):
             hits = []
 
         # Hybrid routing: with nothing matched the card looks exactly as it
-        # always did and Enter goes to the model. The "Ask Ember" row is only
-        # added once there *are* offers, as the escape hatch that stops a good
-        # local match from trapping a question.
+        # always did and Enter goes to the model. In the launcher the "Ask
+        # Ember" row is the escape hatch at the bottom; in a chat, replying is
+        # what Enter should do, so it goes first and the local offers are an
+        # arrow-key away rather than hijacking "yes" or "files" mid-thread.
         if hits:
-            hits = hits + [launcher.Result(
-                "ask", "Ask Ember", query, -1.0, {}, "system-search-symbolic"
-            )]
+            if self.view == CHAT:
+                hits = [launcher.Result("ask", "Reply", query, -1.0, {}, "mail-reply-sender-symbolic")] + hits
+            else:
+                hits = hits + [launcher.Result(
+                    "ask", "Ask Ember", query, -1.0, {}, "system-search-symbolic"
+                )]
 
         self._results = hits
         self._sel = 0
         self._render_rows()
-
-        showing_msg, showing_results = self._body_visibility()
-        self._show_widget(self._msg_scroll, showing_msg, True)
-        self._show_widget(self._results_scroll, showing_results, True)
-        self._animate_card(self.config["active_width"], self._content_height())
+        self._relayout()
 
     def _clear_rows(self):
         for row in self.results.get_children():
@@ -705,7 +1236,8 @@ class Ember(Gtk.Window):
             if candidate is row:
                 self._sel = index
                 break
-        self._activate_selection()
+        if not self._activate_selection():
+            self._ask_model(self.entry.get_text().strip())
 
     def _activate_selection(self):
         """Run the highlighted offer. Returns False when the caller should fall
@@ -713,6 +1245,7 @@ class Ember(Gtk.Window):
         if not self._rows:
             return False
         result = self._rows[self._sel][1]
+        query = self.entry.get_text().strip()
 
         if result.kind == "ask":
             return False
@@ -722,48 +1255,78 @@ class Ember(Gtk.Window):
             self.entry.set_text("")
             self._results = []
             self._clear_rows()
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(result.title, -1)
+            self._track(query, "calc", "ok", response=result.title,
+                        how={"handler": "launcher.calculate"})
+            if self.view == CHAT:
+                self._set_status(f"= {result.title}  ·  copied")
+                self._relayout()
+                return True
             self.response_text = result.title
             self.msg.set_text(result.title)
-            self.footer.set_text("copied to clipboard")
-            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(result.title, -1)
+            self._set_status("copied to clipboard")
             self._set_state(RESPONDING)
             self._start_dwell(result.title)
             return True
 
+        # How long the local path actually took, so the report can put a real
+        # number against the model latency it would be replacing.
+        started = time.monotonic()
+        how = {"handler": f"launcher.{result.kind}", "target": result.title,
+               "commands": [" ".join(result.payload["argv"])] if result.payload.get("argv") else [],
+               "path": result.payload.get("path")}
         try:
             launcher.activate(result)
         except Exception as error:  # noqa: BLE001 - surfaced to the user below
             self.entry.set_text("")
             self._results = []
             self._clear_rows()
-            self.response_text = f"Couldn't open that: {error}"
-            self.msg.set_text(self.response_text)
-            self._set_state(ERROR)
-            self._start_dwell(self.response_text)
+            text = f"Couldn't open that: {error}"
+            self._track(query, result.kind, "error", response=text,
+                        how=how, error=str(error), duration_ms=_ms_since(started))
+            if self.view == CHAT:
+                self._set_status(text)
+                self._relayout()
+                return True
+            self.response_text = text
+            self.msg.set_text(text)
+            self._set_state(RESPONDING)
+            self._start_dwell(text)
             return True
 
-        # Launching is the end of the interaction -- get out of the way.
+        self._track(query, result.kind, "ok", response=result.title, how=how,
+                    duration_ms=_ms_since(started))
+
+        # Launching is the end of the interaction -- get out of the way. A chat
+        # on screen isn't lost; it comes back on the next open.
         self.entry.set_text("")
         self._cancel_dwell()
         self._set_state(IDLE)
         return True
 
     def _open_input(self, initial_text=""):
-        """Opens with a greeting already in place, so it reads as a
-        conversation that has started rather than a blank field. A greeting is
-        only right when the thread is actually new -- mid-conversation it would
-        read as if it had forgotten the last exchange."""
-        # Greet on a genuinely new thread: either this process hasn't spoken yet
-        # (the on-disk session file persists across restarts, so trusting it
-        # alone silently suppressed the greeting for up to 30 minutes after a
-        # restart), or the previous session has aged out and won't be resumed.
-        fresh = self.last_session_id is None or not self.runner._should_resume(cfg.load_state())
-        greeting = cfg.pick_greeting(name=self.config.get("user_name")) if fresh else ""
-        trace("greeting:", repr(greeting))
-        self.msg.set_text(greeting)
-        self.footer.set_text("")
-        self.response_text = ""
-        self._set_state(LISTENING)
+        """Reopen where things were left. A recent conversation comes straight
+        back; otherwise this is the launcher, with a greeting only when the
+        thread is genuinely new -- mid-conversation it would read as if Ember
+        had forgotten the last exchange."""
+        if self._chat_resumable():
+            self._show_chat()
+        else:
+            self.view = LAUNCHER
+            self._model = self.config.get("model", "sonnet")
+            self._paint_model_chip()
+            fresh = not self.runner.will_resume() or not self._messages
+            greeting = cfg.pick_greeting(name=self.config.get("user_name")) if fresh else ""
+            trace("greeting:", repr(greeting))
+            self.msg.set_text(greeting)
+            self.response_text = ""
+            if not fresh:
+                # The session is still alive, just not recent enough to throw
+                # back on screen uninvited. One click brings it back.
+                self._set_status("↑  back to the last chat", self._show_chat)
+            else:
+                self._set_status("")
+            self._set_state(LISTENING)
         if initial_text:
             self.entry.set_text(initial_text)
             self.entry.set_position(-1)
@@ -785,10 +1348,10 @@ class Ember(Gtk.Window):
             self._anim_id = None
 
         alloc = self.card.get_allocation()
-        start_w = alloc.width or target_w
-        start_h = alloc.height or target_h
+        start_w = alloc.width if alloc.width > 1 else target_w
+        start_h = alloc.height if alloc.height > 1 else target_h
 
-        if not animate:
+        if not animate or (start_w, start_h) == (target_w, target_h):
             self._apply_card_size(target_w, target_h)
             return
 
@@ -809,8 +1372,9 @@ class Ember(Gtk.Window):
 
     def _apply_card_size(self, w, h):
         self.card.set_size_request(w, h)
-        x = (CANVAS_W - w) // 2
-        y = (CANVAS_H - h) // 2
+        ax, ay = self._anchor_in
+        x = max(0, min(ax - w // 2, self.canvas_w - w))
+        y = max(0, min(ay - h // 2, self.canvas_h - h))
         self._canvas.move(self.card, x, y)
         self._update_input_region(x, y, w, h)
 
@@ -827,31 +1391,32 @@ class Ember(Gtk.Window):
 
     def _on_enter(self, *_):
         self.hovered = True
-        self._update_opacity()
         self.dot.queue_draw()
         self._cancel_dwell()
         return False
 
-    def _on_leave(self, *_):
+    def _on_leave(self, widget, event):
+        # Leaving into a child widget is not leaving the card.
+        if event.detail == Gdk.NotifyType.INFERIOR:
+            return False
         self.hovered = False
-        self._update_opacity()
         self.dot.queue_draw()
-        if self.state in (RESPONDING, ERROR):
+        if self.state == RESPONDING:
             self._start_dwell(self.response_text)
         return False
 
     def _on_focus_out(self, *_):
-        # Clicking away should put it back to sleep. The menu takes focus while
-        # it is open, so ignore that case or the widget collapses under it.
         trace("focus-out state=", self.state, "raised=", self._raised)
-        if self._menu_open or self.busy_working:
+        # The menu takes focus while it is open; ignore that or the card
+        # collapses under it.
+        if self._menu_open or self.state == IDLE:
             return False
-        if self.state in (LISTENING, RESPONDING, ERROR):
-            self._arm_focus_collapse()
+        self._arm_focus_collapse()
         return False
 
     def _on_focus_in(self, *_):
         self._cancel_focus_collapse()
+        self._cancel_fold()
         return False
 
     def _arm_focus_collapse(self):
@@ -869,9 +1434,42 @@ class Ember(Gtk.Window):
         self._focus_collapse_id = None
         # Re-check rather than trusting the event: focus may well have come
         # straight back during the grace window.
-        if not self.has_toplevel_focus() and self.state in (LISTENING, RESPONDING, ERROR):
+        if self.has_toplevel_focus() or self.state == IDLE:
+            return GLib.SOURCE_REMOVE
+        if self.view == CHAT or self.busy_working:
+            # A conversation is not dismissed by clicking somewhere else -- you
+            # click away to *do* the thing being discussed. It just steps
+            # behind your windows, and Super+Space brings it straight back.
+            if self._raised:
+                self._raised = False
+                self._apply_stacking()
+            self._arm_fold()
+        else:
             self._cancel_dwell()
             self._set_state(IDLE)
+        return GLib.SOURCE_REMOVE
+
+    # An open chat left alone eventually tidies itself back into the dot. It
+    # comes back on the next open, so this costs nothing.
+    def _arm_fold(self):
+        self._cancel_fold()
+        minutes = self.config.get("chat_fold_minutes", 15)
+        if minutes:
+            self._fold_id = GLib.timeout_add_seconds(int(minutes * 60), self._on_fold)
+
+    def _cancel_fold(self):
+        if self._fold_id:
+            GLib.source_remove(self._fold_id)
+            self._fold_id = None
+
+    def _on_fold(self):
+        self._fold_id = None
+        if self.has_toplevel_focus() or self.state == IDLE:
+            return GLib.SOURCE_REMOVE
+        if self.busy_working:
+            self._arm_fold()
+            return GLib.SOURCE_REMOVE
+        self._set_state(IDLE)
         return GLib.SOURCE_REMOVE
 
     def _on_window_state(self, widget, event):
@@ -904,28 +1502,47 @@ class Ember(Gtk.Window):
     def _on_button_release(self, widget, event):
         if self._drag_origin:
             x, y = self.get_position()
-            if (x, y) != (self.config.get("x"), self.config.get("y")):
-                self.config["x"], self.config["y"] = x, y
+            ax, ay = x + self._anchor_in[0], y + self._anchor_in[1]
+            if (ax, ay) != (self.config.get("anchor_x"), self.config.get("anchor_y")):
+                self.config["anchor_x"], self.config["anchor_y"] = ax, ay
                 cfg.save_config(self.config)
+                self._place_window()
             self._drag_origin = None
         return False
 
     def _on_key(self, widget, event):
         key = Gdk.keyval_name(event.keyval)
         control = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        alt = bool(event.state & Gdk.ModifierType.MOD1_MASK)
 
         if key == "Escape":
             if self.busy_working and self._force_cancel_id is None:
                 # First press during a run: warn, don't kill. See FORCE_CANCEL_MS.
                 self._arm_force_cancel()
                 return True
-            self.runner.cancel()
-            self._cancel_force_cancel()
+            if self.busy_working:
+                self._force_stop()
+                return True
+            if self._rows and self.entry.get_text():
+                # First Escape clears a half-typed query; the next one closes.
+                self.entry.set_text("")
+                return True
             self._cancel_dwell()
             self._set_state(IDLE)
             return True
-        if key in ("t", "T") and control:
+        if control and key in ("t", "T"):
             self._open_in_terminal()
+            return True
+        if control and key in ("n", "N"):
+            self._new_chat()
+            return True
+        if control and key in ("m", "M"):
+            self._cycle_model()
+            return True
+        if alt and key in ("1", "2", "3", "4"):
+            index = int(key) - 1
+            if index < len(cfg.MODELS):
+                self._set_model(cfg.MODELS[index]["alias"])
             return True
 
         if self._rows:
@@ -939,6 +1556,16 @@ class Ember(Gtk.Window):
                 self._ask_model(self.entry.get_text().strip())
                 return True
 
+        if key == "Up" and self.view == LAUNCHER and not self.entry.get_text() and self._status_action:
+            self._status_action()
+            return True
+
+        if key in ("Page_Up", "Page_Down") and self.view == CHAT:
+            adj = self._chat_scroll.get_vadjustment()
+            step = adj.get_page_size() * 0.85 * (-1 if key == "Page_Up" else 1)
+            adj.set_value(adj.get_value() + step)
+            return True
+
         if self.state == IDLE and event.string and event.string.isprintable():
             self._open_input(event.string)
             return True
@@ -947,24 +1574,44 @@ class Ember(Gtk.Window):
     def _show_menu(self, event):
         menu = Gtk.Menu()
 
+        new = Gtk.MenuItem(label="New chat\tCtrl+N")
+        new.set_sensitive(bool(self._messages) and not self.busy_working)
+        new.connect("activate", lambda *_: self._new_chat())
+        menu.append(new)
+
+        handoff = Gtk.MenuItem(label="Continue in terminal\tCtrl+T")
+        handoff.set_sensitive(bool(self.last_session_id or self._transcript_session))
+        handoff.connect("activate", lambda *_: self._open_in_terminal())
+        menu.append(handoff)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        default = Gtk.MenuItem(label="Default for new chats")
+        sub = Gtk.Menu()
+        for model in cfg.MODELS:
+            item = Gtk.CheckMenuItem(label=model["label"])
+            item.set_draw_as_radio(True)
+            item.set_active(model["alias"] == self.config.get("model"))
+            item.connect("activate", self._on_pick_default_model, model["alias"])
+            sub.append(item)
+        default.set_submenu(sub)
+        menu.append(default)
+
+        colour = Gtk.MenuItem(label="Colour")
+        sub = Gtk.Menu()
         for name in cfg.ACCENTS:
             item = Gtk.CheckMenuItem(label=name.capitalize())
             item.set_draw_as_radio(True)
             item.set_active(name == self.config.get("accent"))
             item.connect("activate", self._on_pick_accent, name)
-            menu.append(item)
-
-        menu.append(Gtk.SeparatorMenuItem())
+            sub.append(item)
+        colour.set_submenu(sub)
+        menu.append(colour)
 
         above = Gtk.CheckMenuItem(label="Float above windows")
         above.set_active(bool(self.config.get("keep_above")))
         above.connect("toggled", self._on_toggle_above)
         menu.append(above)
-
-        handoff = Gtk.MenuItem(label="Continue in terminal")
-        handoff.set_sensitive(self.last_session_id is not None)
-        handoff.connect("activate", lambda *_: self._open_in_terminal())
-        menu.append(handoff)
 
         menu.append(Gtk.SeparatorMenuItem())
         quit_item = Gtk.MenuItem(label="Quit")
@@ -974,15 +1621,20 @@ class Ember(Gtk.Window):
         quit_item.connect("activate", lambda *_: Gtk.main_quit())
         menu.append(quit_item)
 
-        self._menu_open = True
-        menu.connect("deactivate", self._on_menu_closed)
-        menu.show_all()
-        menu.popup_at_pointer(event)
+        self._popup(menu, event)
 
     def _on_menu_closed(self, *_):
         self._menu_open = False
-        if self.state == LISTENING:
+        if self.state != IDLE:
             self.entry.grab_focus()
+
+    def _on_pick_default_model(self, item, alias):
+        if not item.get_active() or self.config.get("model") == alias:
+            return
+        self.config["model"] = alias
+        cfg.save_config(self.config)
+        if not self._messages:
+            self._set_model(alias, announce=False)
 
     def _on_pick_accent(self, item, name):
         if not item.get_active() or self.config.get("accent") == name:
@@ -1000,9 +1652,10 @@ class Ember(Gtk.Window):
 
     def _open_in_terminal(self):
         """Hand the whole conversation to a real terminal, context intact."""
-        if not self.last_session_id:
+        session = self.last_session_id or self._transcript_session
+        if not session:
             return
-        command = f"claude --resume {self.last_session_id}"
+        command = f"claude --resume {session}"
         terminal = self.config.get("terminal", "gnome-terminal")
         try:
             GLib.spawn_async(
@@ -1011,62 +1664,141 @@ class Ember(Gtk.Window):
             )
         except GLib.Error:
             pass
+        # The card wasn't enough for this one. Recorded because a request that
+        # keeps ending in a terminal is a request the widget is the wrong shape
+        # for -- the opposite finding from a scriptable one, and just as useful.
+        last = next((m.get("text", "") for m in reversed(self._messages) if m.get("role") == "you"), "")
+        self._track(last[:120], "handoff", "ok", session_id=session,
+                    how={"handler": "terminal_handoff", "commands": [command]})
         self._cancel_dwell()
-        self._set_state(IDLE)
+        if not self.busy_working:
+            self._set_state(IDLE)
 
     # -- request flow ------------------------------------------------------
 
     def _on_submit(self, entry):
         prompt = entry.get_text().strip()
-        if not prompt or self.runner.busy:
+        if not prompt:
             return
         # Whatever is highlighted wins. With no local offers there is nothing
-        # highlighted, so this falls straight through to the model exactly as
-        # it always did.
+        # highlighted, so this falls straight through to the model.
         if self._activate_selection():
             return
         self._ask_model(prompt)
 
     def _ask_model(self, prompt):
-        if not prompt or self.runner.busy:
+        if not prompt:
             return
+        directed, cleaned = resolve_model(prompt)
+        if directed:
+            self._set_model(directed, announce=not cleaned)
         self.entry.set_text("")
         self._results = []
         self._clear_rows()
-        self.response_text = ""
-        self.msg.set_text("")
-        self.footer.set_text("")
+        if not cleaned:
+            # A bare "/opus": a switch with nothing to ask yet.
+            self._relayout()
+            return
+
+        if self.busy_working:
+            # Typed while a reply is still coming: hold it and send it next,
+            # rather than refusing or killing the run in flight.
+            self._queue.append(cleaned)
+            self._add_bubble(cleaned, queued=True)
+            self._paint_activity()
+            self._relayout()
+            return
+
+        if self.view == LAUNCHER:
+            if not self.runner.will_resume():
+                # The old session is gone, so its transcript is history.
+                self._messages = []
+                self._transcript_session = None
+                self._clear_chat()
+            self.view = CHAT
+            if not self._chat_built:
+                self._rebuild_chat()
+        self._send(cleaned)
+
+    def _send(self, prompt, bubble=None):
+        if bubble is not None:
+            bubble.set_opacity(1.0)
+        else:
+            self._add_bubble(prompt)
+        self._messages.append({"role": "you", "text": prompt})
+        self._save_transcript()
+
         self._activity = ""
-        self._set_state(THINKING)
+        self._set_status("")
+        self._begin_turn()
+        # Anything still waiting belongs after this reply, not above it.
+        for waiting in self._queued_bubbles():
+            self.chat_box.reorder_child(waiting, -1)
+        if self.state != IDLE:
+            self._set_state(THINKING)
+        self._pending_turn = {"prompt": prompt, "started": time.monotonic(), "model": self._model}
+        self._generation += 1
+        generation = self._generation
+        model = self._model
 
-        thread = threading.Thread(target=self.runner.run, args=(prompt, self._emit), daemon=True)
-        thread.start()
+        def work():
+            self.runner.run(prompt, lambda event: self._emit(event, generation), model=model)
+            GLib.idle_add(self._on_run_finished)
 
-    def _emit(self, event):
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_run_finished(self):
+        """The worker has fully let go of the runner, so a queued follow-up can
+        go now. Driven from here rather than from `done`, because a stopped run
+        never delivers one."""
+        if self._queue and not self.runner.busy and self.state != THINKING:
+            prompt = self._queue.pop(0)
+            bubble = self._queued_bubble()
+            self._send(prompt, bubble)
+        return GLib.SOURCE_REMOVE
+
+    def _queued_bubbles(self):
+        return [c for c in self.chat_box.get_children() if c.get_opacity() < 1.0]
+
+    def _queued_bubble(self):
+        """The oldest still-faded bubble, which is the one about to be sent."""
+        queued = self._queued_bubbles()
+        return queued[0] if queued else None
+
+    def _emit(self, event, generation):
         """Called from the worker thread; hop back to the GTK main loop."""
-        GLib.idle_add(self._handle_event, event)
+        GLib.idle_add(self._handle_event, event, generation)
 
-    def _handle_event(self, event):
+    def _handle_event(self, event, generation):
+        if generation != self._generation:
+            return GLib.SOURCE_REMOVE  # a stopped run's last words
         kind = event["type"]
 
         if kind == "init":
             self.last_session_id = event.get("session_id")
-            self._pending_model = event.get("model", "haiku")
+            self._transcript_session = self.last_session_id
+            self._pending_model = event.get("model", self._model)
+
+        elif kind == "segment":
+            if self._turn is not None:
+                self._turn_segment()
+
+        elif kind == "text":
+            if self._turn is not None:
+                self._turn_text(event["delta"])
 
         elif kind == "tool":
             if self.state == THINKING:
                 self._activity = TOOL_ACTIVITY.get(event.get("name"), "working")
                 self._paint_activity()
 
-        elif kind == "text":
-            if self.state != RESPONDING:
-                self._set_state(RESPONDING)
-            self.response_text += event["delta"]
-            # Stripped as it streams, not just at the end: web search pulls the
-            # model into a trailing "Sources:" list, and rendering it raw meant
-            # watching a block of links appear and then vanish on completion.
-            self.msg.set_text(strip_markdown(self.response_text))
-            self._animate_card(self.config["active_width"], self._content_height())
+        elif kind == "step":
+            if event.get("name") == "ToolSearch":
+                pass  # plumbing, not a step anyone took
+            elif self._turn is not None:
+                self._turn_step(event)
+                self._activity = _activity_from(event)
+                self._paint_activity()
 
         elif kind == "rate_limit":
             info = event.get("info", {})
@@ -1076,33 +1808,100 @@ class Ember(Gtk.Window):
             pass  # The model explains it in plain language; no extra chrome.
 
         elif kind == "done":
-            self.response_text = (event.get("text") or self.response_text).strip()
-            self.msg.set_text(self.response_text)
+            text = (event.get("text") or "").strip()
+            if self._turn is not None and not any(
+                    p["kind"] == "text" and p["text"].strip() for p in self._turn["record"]["parts"]):
+                # Nothing streamed (or only steps did): fall back to the result.
+                self._turn_text(text or "Done.")
+            self.response_text = text
+            self._end_turn()
+            # Folded mid-run (say, by launching an app from the list): the
+            # reply is saved and waits for the next open rather than popping
+            # the card back up uninvited.
+            if self.state != IDLE:
+                self._set_state(LISTENING)
             self._finish_footer()
-            if self.state != RESPONDING:
-                self._set_state(RESPONDING)
-            else:
-                self._animate_card(self.config["active_width"], self._content_height())
-            self._start_dwell(self.response_text)
+            how = event.get("how") or {}
+            # A turn that answered but had tool calls blocked is not a clean
+            # success; the report should be able to tell those apart.
+            outcome = "denied" if how.get("denied") else "ok"
+            self._maybe_notify(text)
+            self._close_turn(outcome, response=text, event=event)
 
         elif kind == "error":
-            self.response_text = event.get("message", "Something went wrong.")
-            self.msg.set_text(self.response_text)
-            self.footer.set_text("")
-            self._set_state(ERROR)
-            self._start_dwell(self.response_text)
+            message = event.get("message", "Something went wrong.")
+            self._turn_note(strip_markdown(message))
+            self._end_turn()
+            if self.state != IDLE:
+                self._set_state(LISTENING)
+            self._close_turn("error", response=message, event=event, error=message)
 
         return GLib.SOURCE_REMOVE
 
     def _finish_footer(self):
-        parts = [self._pending_model]
+        parts = []
         if self.rate_limited:
-            parts.append("quota low")
-        if len(self.response_text) > self.config["handoff_char_threshold"]:
-            parts.append("ctrl+t for terminal")
-        self.footer.set_text("  ·  ".join(parts))
+            parts.append("quota running low")
+        self._set_status("  ·  ".join(parts))
 
-    # -- dwell -------------------------------------------------------------
+    def _maybe_notify(self, text):
+        """A long job that finishes while you're elsewhere says so."""
+        turn = self._pending_turn
+        if not turn or self.has_toplevel_focus():
+            return
+        if _ms_since(turn["started"]) < self.config.get("notify_after_seconds", 15) * 1000:
+            return
+        body = strip_markdown(text).replace("\n", " ")
+        if len(body) > 180:
+            body = body[:178].rstrip() + "…"
+        try:
+            GLib.spawn_async(["notify-send", "-a", "Ember", "Ember", body or "Done."],
+                             flags=GLib.SpawnFlags.SEARCH_PATH)
+        except GLib.Error:
+            pass
+
+    # -- usage tracking ----------------------------------------------------
+    #
+    # Every interaction is appended to ~/.config/ember/history.jsonl so that
+    # `python3 tracker.py report` can say which requests recur often enough, and
+    # run consistently enough, to deserve a local handler instead of a model
+    # call. See tracker.py.
+
+    def _track(self, prompt, route, outcome, **fields):
+        if not self.config.get("track", True):
+            return
+        tracker.log(dict({"prompt": prompt, "route": route, "outcome": outcome}, **fields))
+
+    def _close_turn(self, outcome, response="", event=None, error=None):
+        """Write the record for the in-flight model turn, exactly once.
+
+        Popping the slot first is what guarantees the once: `done` and `error`
+        can both arrive for a single run (a cancelled run emits an error after
+        the user has already been recorded as cancelling), and a duplicate would
+        double-count the very thing the report is trying to measure.
+        """
+        turn = self._pending_turn
+        self._pending_turn = None
+        if not turn:
+            return
+        event = event or {}
+        # The CLI's own duration excludes process startup, so prefer the wall
+        # clock the user actually waited through and fall back to the CLI's.
+        duration_ms = _ms_since(turn["started"]) or event.get("duration_ms")
+        self._track(
+            turn["prompt"], "model", outcome,
+            response=response,
+            duration_ms=duration_ms,
+            ttft_ms=event.get("ttft_ms"),
+            model=self._pending_model or turn.get("model"),
+            how=event.get("how") or {},
+            cost_usd=event.get("cost_usd"),
+            num_turns=event.get("num_turns"),
+            session_id=event.get("session_id") or self.last_session_id,
+            error=error,
+        )
+
+    # -- dwell (launcher-only local results) -------------------------------
 
     def _dwell_seconds(self, text):
         c = self.config
@@ -1122,10 +1921,19 @@ class Ember(Gtk.Window):
             GLib.source_remove(self._dwell_id)
             self._dwell_id = None
 
-    # An empty input left open is the other way it used to get stuck: nothing
-    # was ever scheduled to close it, so it sat open until Escape.
+    def _on_dwell_done(self):
+        self._dwell_id = None
+        if not self.hovered and self.state == RESPONDING:
+            self._set_state(IDLE)
+        return GLib.SOURCE_REMOVE
+
+    # An empty launcher left open is the other way it used to get stuck:
+    # nothing was ever scheduled to close it, so it sat open until Escape. A
+    # chat is exempt -- reading a long answer is not inactivity.
     def _arm_idle_timeout(self):
         self._cancel_idle_timeout()
+        if self.view == CHAT:
+            return
         self._idle_timeout_id = GLib.timeout_add_seconds(
             self.config.get("listen_timeout_seconds", 20), self._on_idle_timeout
         )
@@ -1137,16 +1945,10 @@ class Ember(Gtk.Window):
 
     def _on_idle_timeout(self):
         self._idle_timeout_id = None
-        if self.state == LISTENING and not self.entry.get_text().strip() and not self.runner.busy:
+        if (self.state == LISTENING and self.view == LAUNCHER
+                and not self.entry.get_text().strip() and not self.runner.busy):
             self._set_state(IDLE)
         return GLib.SOURCE_REMOVE
-
-    def _on_dwell_done(self):
-        self._dwell_id = None
-        if not self.hovered:
-            self._set_state(IDLE)
-        return GLib.SOURCE_REMOVE
-
 
     # -- summon ------------------------------------------------------------
 
@@ -1159,9 +1961,10 @@ class Ember(Gtk.Window):
         """
         self._raised = True
         self._cancel_focus_collapse()
+        self._cancel_fold()
         self._apply_stacking()
         self.deiconify()
-        self.present()
+        self._take_focus()
         if self.state == IDLE:
             self._open_input()
         else:
@@ -1169,18 +1972,37 @@ class Ember(Gtk.Window):
         self.entry.grab_focus()
         return GLib.SOURCE_REMOVE
 
+    def _take_focus(self):
+        """present() alone carries no timestamp, and mutter's focus-stealing
+        prevention then raises the window without giving it the keyboard --
+        reliably so when the desktop itself held focus last. A hotkey is as
+        deliberate as input gets, so claim focus with the server's current
+        time instead."""
+        self.present()
+        gdk_window = self.get_window()
+        if gdk_window is not None:
+            try:
+                gdk_window.focus(GdkX11.x11_get_server_time(gdk_window))
+            except (TypeError, AttributeError):
+                pass
+
     def dismiss(self):
         self._cancel_focus_collapse()
         if self.busy_working:
             # Closing mid-run once left a machine with brave-browser removed and
             # never reinstalled: the model had run the remove and was killed
             # before the install. Nothing that closes the card may end a run --
-            # only a deliberate double Escape can.
+            # only a deliberate double Escape can. A chat can step behind the
+            # windows while it works, though.
+            if self._raised and self.has_toplevel_focus():
+                self._raised = False
+                self._apply_stacking()
+                self._arm_fold()
+                return GLib.SOURCE_REMOVE
             self.present()
             self.entry.grab_focus()
             self._arm_force_cancel()
             return GLib.SOURCE_REMOVE
-        self.runner.cancel()
         self._cancel_dwell()
         self._set_state(IDLE)  # also clears the raise
         return GLib.SOURCE_REMOVE
@@ -1188,12 +2010,14 @@ class Ember(Gtk.Window):
     def toggle(self):
         trace("toggle arrives, state=", self.state, "raised=", self._raised,
               "pending_collapse=", self._focus_collapse_id is not None)
-        # A collapse still pending means Ember is open as far as the user is
-        # concerned -- that focus-out was the hotkey's own grab, not a click
-        # away -- so this press is a dismiss.
-        open_now = self.state != IDLE or self._focus_collapse_id is not None
+        # A collapse still pending means Ember is in front as far as the user
+        # is concerned -- that focus-out was the hotkey's own grab, not a click
+        # away -- so this press is a dismiss. A chat that has stepped behind
+        # the windows is open but out of sight, so the hotkey brings it back.
+        in_front = self.state != IDLE and (
+            self._focus_collapse_id is not None or self.has_toplevel_focus() or self._raised)
         self._cancel_focus_collapse()
-        return self.dismiss() if open_now else self.summon()
+        return self.dismiss() if in_front else self.summon()
 
     def on_ipc(self, message):
         """Called on the IPC worker thread; hop to the GTK loop before touching
