@@ -10,6 +10,7 @@ one. Idle sessions need no cleanup -- they simply stop being referenced.
 
 import json
 import os
+import pathlib
 import re
 import subprocess
 import threading
@@ -181,6 +182,32 @@ def effort_for(model, config):
         return effort.get(model)
     # Old configs held one string, which was only ever tuned for Haiku.
     return effort if model == "haiku" else None
+
+
+def list_in_resume_picker(session_id):
+    """Make an Ember session show up in a terminal's `claude --resume` picker.
+
+    The picker drops every session whose `entrypoint` is an SDK one, and
+    `claude -p` always records itself as `sdk-cli` -- CLAUDE_CODE_ENTRYPOINT
+    does not override it in print mode. So without this, every Ember chat is
+    resumable by id but invisible in the list. Retagging it as `cli` after the
+    process has exited is safe: the field is only metadata, nothing else is
+    writing the file by then, and the next `-p --resume` still works on it.
+    """
+    if not session_id:
+        return
+    root = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"))
+    for path in (root / "projects").glob(f"*/{session_id}.jsonl"):
+        try:
+            data = path.read_text()
+            if '"entrypoint":"sdk-cli"' not in data:
+                continue
+            tmp = path.with_suffix(".jsonl.tmp")
+            tmp.write_text(data.replace('"entrypoint":"sdk-cli"', '"entrypoint":"cli"'))
+            os.chmod(tmp, path.stat().st_mode)
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
 
 class EmberRunner:
@@ -458,6 +485,7 @@ class EmberRunner:
         except (OSError, ValueError):
             pass
         process.wait()
+        list_in_resume_picker(state["session_id"])
 
         if final_result is not None:
             event = final_result

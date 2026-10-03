@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Terminal entry point.
+#
+#   ember --resume [id|search]   pick up an Ember chat in the claude CLI
+#   ember                        open the card, same as Super+Space
+#
+# Ember's chats live under its workspace directory, and `claude --resume` only
+# lists the directory it runs in -- so it has to run from there.
+here="$(dirname "$(readlink -f "$0")")"
+
+case "$1" in
+    -r|--resume)
+        shift
+        cd "$here/workspace" || exit 1
+        exec claude --resume "$@"
+        ;;
+    "")
+        exec "$here/ember-toggle"
+        ;;
+    *)
+        echo "usage: ember [--resume [id|search]]" >&2
+        exit 2
+        ;;
+esac
