@@ -29,9 +29,10 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("GdkX11", "3.0")
-from gi.repository import Gdk, GdkPixbuf, GdkX11, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GdkX11, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
 import cairo  # noqa: E402
 
@@ -62,6 +63,16 @@ LAUNCHER_MAX_H = 460
 DOT_ABOVE_BOTTOM = 150
 ANIM_MS = 16
 ANIM_DURATION = 0.30
+# A sent message lifting out of the input bar and settling into its bubble.
+FLY_DURATION = 0.38
+BUBBLE_RADIUS = 18
+# Opening and closing are a shape change, not just a resize, so they get a
+# little longer for the morph to actually be seen.
+MORPH_DURATION = 0.42
+# The card's own corner radius, and the band the dot's outer ring becomes
+# around it when open: 9px is ~2.5mm on this 1080p 24" panel.
+CARD_RADIUS = 26
+RING_BAND = 9
 # Card padding (the inner box's border width).
 PAD = 20
 
@@ -111,6 +122,20 @@ def _ms_since(started):
 
 def ease_out_cubic(t):
     return 1 - pow(1 - t, 3)
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def rounded_rect(ctx, x, y, w, h, radius):
+    radius = max(0.0, min(radius, w / 2, h / 2))
+    ctx.new_sub_path()
+    ctx.arc(x + w - radius, y + radius, radius, -math.pi / 2, 0)
+    ctx.arc(x + w - radius, y + h - radius, radius, 0, math.pi / 2)
+    ctx.arc(x + radius, y + h - radius, radius, math.pi / 2, math.pi)
+    ctx.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
+    ctx.close_path()
 
 
 def hex_to_rgb(value):
@@ -225,6 +250,183 @@ class Fold(Gtk.Box):
         self._on_resize()
 
 
+def _glyph_spark(ctx, w, h, t, energy, rgb):
+    """Off the cuff: a quick little spark that can't keep still."""
+    cx, base = w / 2, h * 0.72
+    hop = abs(math.sin(t * (4.5 + 5 * energy)))
+    lift = (h * 0.42) * hop * (0.45 + 0.55 * energy)
+    for lag, fade in ((0.09, 0.18), (0.045, 0.35)):
+        trail = abs(math.sin((t - lag) * (4.5 + 5 * energy))) * (h * 0.42) * (0.45 + 0.55 * energy)
+        ctx.set_source_rgba(*rgb, fade)
+        ctx.arc(cx, base - trail, 3.2, 0, 2 * math.pi)
+        ctx.fill()
+    # Squashes a touch on landing, which is most of what makes a hop read.
+    squash = 1 + 0.2 * (1 - hop) ** 4
+    ctx.save()
+    ctx.translate(cx, base - lift)
+    ctx.scale(squash, 1 / squash)
+    ctx.set_source_rgba(*rgb, 1.0)
+    ctx.arc(0, 0, 5.5, 0, 2 * math.pi)
+    ctx.fill()
+    ctx.restore()
+
+
+def _glyph_breathe(ctx, w, h, t, energy, rgb):
+    """Thinking cap: Ember itself, in miniature, breathing as usual."""
+    cx, cy = w / 2, h / 2
+    phase = (math.sin(t * 2 * math.pi / (2.6 - energy)) + 1) / 2
+    core = 7.5 * (0.8 + 0.2 * phase)
+    ctx.set_source_rgba(*rgb, 0.25 * (0.6 + 0.4 * phase))
+    ctx.arc(cx, cy, core * 1.75, 0, 2 * math.pi)
+    ctx.fill()
+    ctx.set_source_rgba(*rgb, 0.6 + 0.4 * phase)
+    ctx.arc(cx, cy, core, 0, 2 * math.pi)
+    ctx.fill()
+
+
+def _glyph_orbit(ctx, w, h, t, energy, rgb):
+    """Sleeves rolled up: a core with three dots hard at work around it."""
+    cx, cy = w / 2, h / 2
+    ctx.set_source_rgba(*rgb, 1.0)
+    ctx.arc(cx, cy, 5.5, 0, 2 * math.pi)
+    ctx.fill()
+    spin = t * (1.4 + 3.2 * energy)
+    for i in range(3):
+        angle = spin + i * 2 * math.pi / 3
+        # A tilted orbit, so they swing past rather than just going round.
+        x = cx + 13 * math.cos(angle)
+        y = cy + 6 * math.sin(angle)
+        behind = math.sin(angle) < 0
+        ctx.set_source_rgba(*rgb, 0.45 if behind else 0.95)
+        ctx.arc(x, y, 2.4 if behind else 3.0, 0, 2 * math.pi)
+        ctx.fill()
+
+
+def _glyph_steam(ctx, w, h, t, energy, rgb):
+    """Slow burn: an ember glowing away while the kettle gets going."""
+    cx, cy = w / 2, h * 0.7
+    glow = (math.sin(t * 2 * math.pi / 4.5) + 1) / 2
+    ctx.set_source_rgba(*rgb, 0.22 + 0.18 * glow)
+    ctx.arc(cx, cy, 10 + 2 * glow, 0, 2 * math.pi)
+    ctx.fill()
+    ctx.set_source_rgba(*rgb, 0.75 + 0.25 * glow)
+    ctx.arc(cx, cy, 6, 0, 2 * math.pi)
+    ctx.fill()
+    ctx.set_line_width(1.8)
+    ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+    rise_speed = 0.35 + 0.45 * energy
+    for i, offset in enumerate((-5.0, 4.0)):
+        life = (t * rise_speed + i * 0.5) % 1.0
+        ctx.set_source_rgba(*rgb, 0.7 * math.sin(life * math.pi))
+        top = cy - 12 - life * (h * 0.45)
+        for step in range(9):
+            k = step / 8
+            y = top + k * 9
+            x = cx + offset + 2.5 * math.sin(k * 5 + t * 2.2 + i)
+            ctx.line_to(x, y) if step else ctx.move_to(x, y)
+        ctx.stroke()
+
+
+MOOD_GLYPHS = {"haiku": _glyph_spark, "sonnet": _glyph_breathe,
+               "opus": _glyph_orbit, "fable": _glyph_steam}
+
+
+class MoodTile(Gtk.EventBox):
+    """One choice in the model tray: a little animated glyph acting out the
+    mood, its name, and its blurb. Paints its own pill so it matches the card
+    rather than the theme."""
+
+    def __init__(self, model, on_pick, palette):
+        super().__init__()
+        self.set_visible_window(False)
+        self.alias = model["alias"]
+        self._on_pick = on_pick
+        self._palette = palette
+        self.hot = False
+        self.picked = False
+        self._energy = 0.0
+        self._pop_at = None
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_border_width(8)
+        self.glyph = Gtk.DrawingArea()
+        self.glyph.set_size_request(64, 52)
+        self.glyph.connect("draw", self._draw_glyph)
+        box.pack_start(self.glyph, False, False, 0)
+        title = Gtk.Label(label=model["label"])
+        title.get_style_context().add_class("ember-mood-title")
+        box.pack_start(title, False, False, 0)
+        blurb = Gtk.Label(label=model["blurb"])
+        blurb.set_line_wrap(True)
+        blurb.set_justify(Gtk.Justification.CENTER)
+        blurb.set_max_width_chars(14)
+        blurb.get_style_context().add_class("ember-mood-blurb")
+        box.pack_start(blurb, False, False, 0)
+        self.add(box)
+
+        self.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+                        | Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect("enter-notify-event", lambda *_: self._set_hot(True))
+        self.connect("leave-notify-event", self._on_leave)
+        self.connect("button-press-event", self._on_press)
+        self.connect("draw", self._draw_pill)
+
+    def _set_hot(self, on):
+        self.hot = on
+        self.queue_draw()
+        return False
+
+    def _on_leave(self, widget, event):
+        if event.detail != Gdk.NotifyType.INFERIOR:
+            self._set_hot(False)
+        return False
+
+    def _on_press(self, widget, event):
+        if event.button == 1:
+            self._on_pick(self)
+            return True
+        return False
+
+    def pop(self):
+        self._pop_at = time.monotonic()
+
+    def tick(self, t, dt):
+        # Hover and the current pick are fully awake; the rest idle gently.
+        target = 1.0 if (self.hot or self.picked) else 0.25
+        self._energy += (target - self._energy) * min(1.0, dt * 8)
+        self._t = t
+        self.glyph.queue_draw()
+
+    def _draw_pill(self, widget, ctx):
+        if not (self.hot or self.picked):
+            return False
+        a = widget.get_allocation()
+        ctx.set_source_rgba(*self._palette()["dot"], 0.32 if self.picked else 0.16)
+        rounded_rect(ctx, 0, 0, a.width, a.height, 16)
+        ctx.fill()
+        return False
+
+    def _draw_glyph(self, widget, ctx):
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        scale = 1.0
+        if self._pop_at is not None:
+            # A springy pop on being picked: up past full size and back.
+            k = (time.monotonic() - self._pop_at) / 0.45
+            if k >= 1:
+                self._pop_at = None
+            else:
+                scale = 1 + 0.45 * math.sin(k * math.pi) * (1 - k)
+        # Glyphs are drawn on a 48x40 grid and scaled up to the area.
+        zoom = min(w / 48, h / 40) * scale
+        ctx.translate(w / 2, h / 2)
+        ctx.scale(zoom, zoom)
+        ctx.translate(-24, -20)
+        MOOD_GLYPHS.get(self.alias, _glyph_breathe)(
+            ctx, 48, 40, getattr(self, "_t", 0.0), self._energy, self._palette()["dot"])
+        return False
+
+
 class Segment(Gtk.Box):
     """One block of model text. Prose renders as markup; fenced code goes
     behind a fold. Updated in place while it streams, rebuilt only when the
@@ -283,6 +485,22 @@ class Ember(Gtk.Window):
         self._menu_open = False
         self._pulse_phase = 0.0
         self._drag_origin = None
+        # The outer ring's pull towards the cursor: a deformation vector in
+        # ring radii plus its velocity, chased towards _jelly_target by a
+        # spring so it lags, overshoots and settles like something soft.
+        self._jelly = [0.0, 0.0, 0.0, 0.0]
+        self._jelly_target = (0.0, 0.0)
+        # 0 = breathing freely, 1 = held at full size under the cursor.
+        self._swell = 0.0
+        # 0 = the resting dot, 1 = the open card; the dot's breath scale at
+        # the moment it opened, so the morph starts from exactly what was seen.
+        self._morph = 0.0
+        self._morph_from_scale = 1.0
+        self._card_rect = (0, 0, 1, 1)
+        # A message in flight from the input bar to its bubble: where it left
+        # from, what it says, and the bubble it is heading for.
+        self._fly = None
+        self._fly_from = None
 
         # The model for the conversation on screen. Starts at the configured
         # default; the chip, Alt+1-4, Ctrl+M or a "/opus" prefix change it, and
@@ -436,6 +654,9 @@ class Ember(Gtk.Window):
         self.card.connect("button-press-event", self._on_button_press)
         self.card.connect("button-release-event", self._on_button_release)
         self.card.connect("motion-notify-event", self._on_motion)
+        self.card.connect("draw", self._draw_card)
+        # After the children, so the flying message passes over the chat.
+        self.card.connect_after("draw", self._draw_flight)
         canvas.put(self.card, 0, 0)
 
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -497,6 +718,20 @@ class Ember(Gtk.Window):
         self._results_scroll.add(self.results)
         inner.pack_start(self._results_scroll, False, False, 0)
 
+        # The model tray: the chip unfolds it inside the card rather than
+        # popping a theme-coloured menu out of it.
+        self.mood_tray = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, homogeneous=True)
+        self._mood_tiles = []
+        palette = lambda: {"dot": hex_to_rgb(cfg.accent_colors(self.config)["dot"])}
+        for model in cfg.MODELS:
+            tile = MoodTile(model, self._on_mood_pick, palette)
+            self._mood_tiles.append(tile)
+            self.mood_tray.pack_start(tile, True, True, 0)
+        self._show_widget(self.mood_tray, False)
+        self._mood_tick_id = None
+        self._mood_close_id = None
+        inner.pack_start(self.mood_tray, False, False, 0)
+
         # Footer: what's happening on the left, the conversation's controls on
         # the right. The model chip is always there once the card is open, so
         # picking the right model is one click rather than a phrase to recall.
@@ -532,25 +767,26 @@ class Ember(Gtk.Window):
         dot = colors["dot"]
         css = f"""
         window {{ background-color: transparent; }}
-        .ember-card {{
-            background-color: {surface};
-            border-radius: 26px;
-        }}
-        /* At rest the surface disappears entirely and only the dot remains.
-           Fading the whole card instead just turns the cream muddy grey. */
-        .ember-card.dormant {{
-            background-color: alpha({surface}, 0.0);
-        }}
+        /* The card's surface and its ring are painted in _draw_card, so the
+           dot can morph into them; CSS only has to stay out of the way. */
+        .ember-card {{ background-color: transparent; }}
+        /* The input is the bubble-to-be: same tint, shape and type as your
+           sent messages, stretched edge to edge. */
         .ember-input {{
-            background: transparent;
+            background-color: alpha({dot}, 0.30);
+            background-image: none;
             border: none;
+            border-radius: {BUBBLE_RADIUS}px;
             box-shadow: none;
+            outline: none;
+            padding: 9px 15px;
             color: {text};
             font-family: "{font}", "Cantarell", sans-serif;
-            font-size: {size}px;
+            font-size: {size - 1}px;
             caret-color: {text};
         }}
-        .ember-input placeholder {{ color: alpha({text}, 0.35); }}
+        .ember-input placeholder {{ color: alpha({text}, 0.4); }}
+        .ember-input selection {{ background-color: alpha({dot}, 0.55); color: {text}; }}
         .ember-card scrolledwindow,
         .ember-card viewport {{ background-color: transparent; }}
         .ember-card scrollbar {{ background-color: transparent; border: none; }}
@@ -570,7 +806,7 @@ class Ember(Gtk.Window):
         .ember-you {{
             color: {text};
             background-color: alpha({dot}, 0.30);
-            border-radius: 18px;
+            border-radius: {BUBBLE_RADIUS}px;
             padding: 8px 15px;
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {size - 1}px;
@@ -637,6 +873,17 @@ class Ember(Gtk.Window):
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {max(10, size - 7)}px;
         }}
+        .ember-mood-title {{
+            color: {text};
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {max(12, size - 5)}px;
+            font-weight: 600;
+        }}
+        .ember-mood-blurb {{
+            color: alpha({text}, 0.5);
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {max(10, size - 7)}px;
+        }}
         tooltip {{ border-radius: 10px; }}
         """
         provider = Gtk.CssProvider()
@@ -655,14 +902,7 @@ class Ember(Gtk.Window):
         cx, cy = w / 2, h / 2
 
         if self.state == IDLE:
-            # Breathes quicker while a run is still going behind a folded card.
-            speed = 0.85 if self.runner.busy else 2.6
-            phase = (math.sin(self._pulse_phase * (2 * math.pi) / speed) + 1) / 2
-            scale = 0.78 + 0.22 * phase
-            alpha = 0.6 + 0.4 * phase
-            if self.hovered:
-                # Only hover affordance while idle, since the card stays hidden.
-                scale, alpha = 1.0, 1.0
+            scale, alpha, speed = self._breath()
         else:
             scale, alpha = 1.0, 1.0
 
@@ -672,18 +912,170 @@ class Ember(Gtk.Window):
 
         # Soft outer ring so it reads as a deliberate object on the wallpaper
         # rather than a stray speck, without resorting to a gradient.
-        ctx.set_source_rgba(r, g, b, alpha * 0.25)
-        ctx.arc(cx, cy, core * 1.75, 0, 2 * math.pi)
+        # Hover belongs to the ring alone: the core keeps breathing, and the
+        # ring firms up a touch and reaches for the cursor.
+        ring_alpha = 0.34 if self.hovered and self.state == IDLE else 0.25
+        ctx.set_source_rgba(r, g, b, alpha * ring_alpha)
+        if self.state == IDLE:
+            self._trace_jelly(ctx, cx, cy, core * 1.75)
+        else:
+            ctx.arc(cx, cy, core * 1.75, 0, 2 * math.pi)
         ctx.fill()
 
         ctx.set_source_rgba(r, g, b, alpha)
-        ctx.arc(cx, cy, core, 0, 2 * math.pi)
+        if self.state == IDLE:
+            self._trace_wobble(ctx, cx, cy, core, speed)
+        else:
+            ctx.arc(cx, cy, core, 0, 2 * math.pi)
         ctx.fill()
         return False
+
+    def _breath(self):
+        """(scale, alpha, period) of the resting dot right now."""
+        # Breathes quicker while a run is still going behind a folded card.
+        speed = 0.85 if self.runner.busy else 2.6
+        phase = (math.sin(self._pulse_phase * (2 * math.pi) / speed) + 1) / 2
+        scale = 0.78 + 0.22 * phase
+        alpha = 0.6 + 0.4 * phase
+        # Under the cursor the breath is drawn up to full and held there;
+        # already at full, nothing visibly changes.
+        scale += (1.0 - scale) * self._swell
+        alpha += (1.0 - alpha) * self._swell
+        return scale, alpha, speed
+
+    def _draw_card(self, widget, ctx):
+        """The card's surface: the dot's core grown into the cream box, its
+        outer ring grown into a thin band around it.
+
+        Both shapes are interpolated from the dot's circles (centred in the
+        card) to their final rounded rectangles, while the card itself is being
+        resized by _animate_card -- so at 0 this draws the dot, at 1 the card.
+        Runs before the children draw, so the content sits on top.
+        """
+        e = self._morph
+        if e <= 0.0:
+            return False
+        x, y, w, h = self._card_rect
+        # The dot sits on the anchor, which is the card's centre unless the
+        # card is pinned against a canvas edge; the circles start from there
+        # and travel to the box's centre.
+        ax, ay = self._anchor_in
+        cx = lerp(ax - x, w / 2, e)
+        cy = lerp(ay - y, h / 2, e)
+        core = self.config["dot_size"] / 4 * self._morph_from_scale
+        ring = core * 1.75
+        accent = hex_to_rgb(cfg.accent_colors(self.config)["dot"])
+        surface = hex_to_rgb(self.config["surface"])
+
+        # Corners lag the size, so it stays a stretched blob for a moment
+        # rather than turning into a rounded square straight away.
+        corner = e * e
+        ctx.set_source_rgba(*accent, lerp(0.25, 0.45, e))
+        rounded_rect(ctx, lerp(cx - ring, 0, e), lerp(cy - ring, 0, e),
+                     lerp(2 * ring, w, e), lerp(2 * ring, h, e),
+                     lerp(ring, CARD_RADIUS + RING_BAND, corner))
+        ctx.fill()
+
+        # The colour lags the shape slightly, so it still reads as the dot
+        # stretching before it turns into paper.
+        tint = min(1.0, e * 1.25)
+        ctx.set_source_rgb(*(lerp(a, b, tint) for a, b in zip(accent, surface)))
+        rounded_rect(ctx, lerp(cx - core, RING_BAND, e), lerp(cy - core, RING_BAND, e),
+                     lerp(2 * core, w - 2 * RING_BAND, e), lerp(2 * core, h - 2 * RING_BAND, e),
+                     lerp(core, CARD_RADIUS, corner))
+        ctx.fill()
+        return False
+
+    def _set_morph(self, value):
+        """Advance the open/close morph and fade whatever is inside to match:
+        content only arrives once the box is mostly formed, and on the way back
+        the dot fades in as the box closes around it."""
+        self._morph = value
+        if self.state == IDLE:
+            self._inner.set_opacity(1.0 - value)
+        else:
+            self._inner.set_opacity(max(0.0, min(1.0, (value - 0.55) / 0.45)))
+        self.card.queue_draw()
+
+    def _trace_wobble(self, ctx, cx, cy, core, speed):
+        """The core as a gently deforming blob rather than a rigid disc.
+
+        A couple of slow lobes drift round the edge at different rates, so the
+        shape never quite repeats. The wobble is tied to the breath's velocity:
+        it swells while the dot is growing or shrinking and settles at the top
+        and bottom of each breath, which is what makes it read as liquid
+        moving rather than as a shape that is merely distorted.
+        """
+        t = self._pulse_phase
+        velocity = abs(math.cos(t * (2 * math.pi) / speed))
+        amount = 0.018 + 0.03 * velocity
+        steps = 96
+        for i in range(steps + 1):
+            theta = 2 * math.pi * i / steps
+            ripple = (0.6 * math.sin(2 * theta + t * 1.1)
+                      + 0.4 * math.sin(3 * theta - t * 0.7 + 1.3))
+            radius = core * (1 + amount * ripple)
+            x = cx + radius * math.cos(theta)
+            y = cy + radius * math.sin(theta)
+            if i == 0:
+                ctx.move_to(x, y)
+            else:
+                ctx.line_to(x, y)
+        ctx.close_path()
+
+    def _trace_jelly(self, ctx, cx, cy, ring):
+        """The outer ring as a soft membrane the cursor tugs on.
+
+        It stretches towards the pull, pinches slightly at the sides and gives
+        a little at the back, so it reads as one body being drawn out rather
+        than a circle sliding over. A faint surface ripple rides on top while
+        the jelly is still moving, and dies away as it settles.
+        """
+        jx, jy, vx, vy = self._jelly
+        pull = math.hypot(jx, jy)
+        heading = math.atan2(jy, jx)
+        shiver = min(1.0, math.hypot(vx, vy) * 0.15)
+        t = self._pulse_phase
+        steps = 96
+        for i in range(steps + 1):
+            theta = 2 * math.pi * i / steps
+            c = math.cos(theta - heading)
+            # Front +0.11, back -0.06, sides -0.025 at full pull: the front
+            # stays inside the 0.5 allocation headroom at the top of a breath.
+            stretch = pull * (0.085 * c + 0.05 * (c * c - 0.5))
+            ripple = 0.012 * shiver * math.sin(3 * theta - t * 7.0)
+            radius = ring * (1 + stretch + ripple)
+            x = cx + radius * math.cos(theta)
+            y = cy + radius * math.sin(theta)
+            if i == 0:
+                ctx.move_to(x, y)
+            else:
+                ctx.line_to(x, y)
+        ctx.close_path()
+
+    def _step_jelly(self, dt):
+        """Underdamped spring towards the cursor's pull. Returns whether the
+        jelly is still moving, so a settled ring costs nothing extra."""
+        jx, jy, vx, vy = self._jelly
+        tx, ty = self._jelly_target
+        stiffness, damping = 90.0, 7.5
+        vx += (stiffness * (tx - jx) - damping * vx) * dt
+        vy += (stiffness * (ty - jy) - damping * vy) * dt
+        jx += vx * dt
+        jy += vy * dt
+        if abs(jx - tx) + abs(jy - ty) + abs(vx) + abs(vy) < 1e-3:
+            jx, jy, vx, vy = tx, ty, 0.0, 0.0
+        self._jelly = [jx, jy, vx, vy]
+        return bool(vx or vy)
 
     def _on_pulse_tick(self):
         if self.state == IDLE:
             self._pulse_phase += ANIM_MS / 1000.0
+            self._step_jelly(ANIM_MS / 1000.0)
+            # Exponential ease: quick enough to feel like a response, slow
+            # enough (~0.3s) to be seen growing rather than snapping.
+            target = 1.0 if self.hovered else 0.0
+            self._swell += (target - self._swell) * min(1.0, ANIM_MS / 1000.0 * 11)
             self.dot.queue_draw()
         return GLib.SOURCE_CONTINUE
 
@@ -775,29 +1167,40 @@ class Ember(Gtk.Window):
 
     # -- state machine -----------------------------------------------------
 
+    def _idle_size(self):
+        # Never smaller than the dot: the resting card is also the hit region,
+        # and one smaller than the dot left only its top-left part hoverable
+        # (and pushed the dot's centre off the anchor).
+        dot = self.config["dot_size"]
+        return max(self.config["idle_width"], dot), max(self.config["idle_height"], dot)
+
     def _card_width(self):
         if self.state == IDLE:
-            return self.config["idle_width"]
-        return self.config["chat_width"] if self.view == CHAT else self.config["active_width"]
+            return self._idle_size()[0]
+        # Plus the ring band either side, so the text keeps the width it had.
+        width = self.config["chat_width"] if self.view == CHAT else self.config["active_width"]
+        return width + 2 * RING_BAND
 
     def _target_geometry(self):
         if self.state == IDLE:
-            return self.config["idle_width"], self.config["idle_height"]
+            return self._idle_size()
         return self._card_width(), self._content_height()
 
     def _content_height(self):
         # _inner carries its own border width, so the padding is counted here
         # once and only once -- double-counting it left a dead gap under the text.
-        extra = 2 * PAD
+        extra = 2 * (PAD + RING_BAND)
         body = 0
         spacing = self._inner.get_spacing()
         ceiling = self.chat_max_h if self.view == CHAT else self.launcher_max_h
-        width = self._card_width() - 2 * PAD
+        width = self._card_width() - 2 * (PAD + RING_BAND)
 
         if self.entry.get_visible():
             extra += self.entry.get_preferred_height()[1] + spacing
         if self.footer.get_visible():
             extra += self.footer.get_preferred_height()[1] + spacing
+        if self.mood_tray.get_visible():
+            extra += self.mood_tray.get_preferred_height_for_width(width)[1] + spacing
         if self._results_scroll.get_visible():
             _, rows_h = self.results.get_preferred_height()
             rows_h = min(rows_h, MAX_RESULTS_H)
@@ -847,6 +1250,8 @@ class Ember(Gtk.Window):
         self._animate_card(*self._target_geometry(), animate)
 
     def _set_state(self, state, animate=True):
+        if self.state == IDLE and state != IDLE:
+            self._morph_from_scale = self._breath()[0]
         previous, self.state = self.state, state
         if state not in (LISTENING, THINKING):
             # Offers belong to the query that produced them; carrying them into
@@ -855,13 +1260,15 @@ class Ember(Gtk.Window):
             self._clear_rows()
 
         open_ = state != IDLE
+        if state in (IDLE, THINKING) and self.mood_tray.get_visible():
+            self._set_mood_tray(False)
         self._show_widget(self.dot, not open_)
         self._show_widget(self.entry, open_)
         self._show_widget(self.footer, open_, True)
         if self.view == CHAT and open_ and not self._chat_built:
             self._rebuild_chat()
 
-        self._inner.set_border_width(PAD if open_ else 0)
+        self._inner.set_border_width(PAD + RING_BAND if open_ else 0)
         self._update_opacity()
 
         if state == THINKING:
@@ -887,7 +1294,7 @@ class Ember(Gtk.Window):
             # In a chat the input sits under a wall of text; a faint prompt
             # keeps it findable when the caret blinks off.
             self.entry.set_placeholder_text(
-                "" if self.view == LAUNCHER else
+                "Ask me anything…" if self.view == LAUNCHER else
                 "Add something — it'll go next" if state == THINKING else "Reply…")
             self.entry.grab_focus()
             self._arm_idle_timeout()
@@ -950,11 +1357,14 @@ class Ember(Gtk.Window):
     def _rebuild_chat(self):
         """Recreate the transcript widgets from the saved record."""
         self._clear_chat()
+        # History appears in place; only the message being sent gets to fly.
+        flight, self._fly_from = self._fly_from, None
         for message in self._messages:
             if message.get("role") == "you":
                 self._add_bubble(message.get("text", ""))
             else:
                 self._add_reply(message)
+        self._fly_from = flight
         self._chat_built = True
         self._stick_bottom = True
         self.chat_box.show_all()
@@ -970,7 +1380,92 @@ class Ember(Gtk.Window):
         row.show_all()
         self.chat_box.pack_start(row, False, False, 0)
         self._stick_bottom = True
+        start, self._fly_from = self._fly_from, None
+        if start is not None:
+            self._fly_bubble(label, text, start, 0.55 if queued else 1.0)
         return row
+
+    # -- sent-message flight -----------------------------------------------
+
+    def _entry_rect(self):
+        """The input bar's rectangle in card coordinates, or None."""
+        if not self.entry.get_visible():
+            return None
+        coords = self.entry.translate_coordinates(self.card, 0, 0)
+        alloc = self.entry.get_allocation()
+        if not coords or alloc.width <= 1:
+            return None
+        return (coords[0], coords[1], alloc.width, alloc.height)
+
+    def _fly_bubble(self, label, text, start, alpha):
+        """Lift the message out of the input bar and settle it into its bubble.
+
+        The real bubble's label stays invisible underneath while a copy is
+        drawn over the card, morphing from the bar's rectangle to the label's.
+        The target is re-read every frame, so it still lands if the chat
+        scrolls or the card resizes on the way (the first send does both).
+        """
+        if self._fly:
+            self._end_flight()
+        label.set_opacity(0.0)
+        self._fly = {"label": label, "text": text, "start": start,
+                     "began": time.monotonic(), "alpha": alpha, "id": None}
+
+        def tick():
+            fly = self._fly
+            if fly is None:
+                return GLib.SOURCE_REMOVE
+            if time.monotonic() - fly["began"] >= FLY_DURATION:
+                self._end_flight()
+                return GLib.SOURCE_REMOVE
+            self.card.queue_draw()
+            return GLib.SOURCE_CONTINUE
+
+        self._fly["id"] = GLib.timeout_add(ANIM_MS, tick)
+
+    def _end_flight(self):
+        fly, self._fly = self._fly, None
+        if fly is None:
+            return
+        if fly["id"]:
+            GLib.source_remove(fly["id"])
+        fly["label"].set_opacity(1.0)
+        self.card.queue_draw()
+
+    def _draw_flight(self, widget, ctx):
+        fly = self._fly
+        if fly is None:
+            return False
+        label = fly["label"]
+        coords = label.translate_coordinates(self.card, 0, 0) if label.get_mapped() else None
+        alloc = label.get_allocation()
+        if not coords or alloc.width <= 1:
+            return False
+        end = (coords[0], coords[1], alloc.width, alloc.height)
+        k = min(1.0, (time.monotonic() - fly["began"]) / FLY_DURATION)
+        e = ease_out_cubic(k)
+        x, y, w, h = (lerp(a, b, e) for a, b in zip(fly["start"], end))
+
+        colors = cfg.accent_colors(self.config)
+        # Queued messages land faded, like the bubble they become.
+        alpha = lerp(1.0, fly["alpha"], e)
+        ctx.save()
+        rounded_rect(ctx, x, y, w, h, BUBBLE_RADIUS)
+        ctx.clip_preserve()
+        ctx.set_source_rgba(*hex_to_rgb(colors["dot"]), 0.30 * alpha)
+        ctx.fill()
+
+        # The text re-wraps to the shrinking width as it goes, so it reads as
+        # the same words settling rather than a picture being squashed.
+        layout = label.create_pango_layout(fly["text"])
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        layout.set_width(int(max(1, w - 30) * Pango.SCALE))
+        _, text_h = layout.get_pixel_size()
+        ctx.set_source_rgba(*hex_to_rgb(colors["text"]), alpha)
+        ctx.move_to(x + 15, y + (h - text_h) / 2)
+        PangoCairo.show_layout(ctx, layout)
+        ctx.restore()
+        return False
 
     def _add_reply(self, record):
         """Widgets for one saved Ember turn."""
@@ -1088,12 +1583,16 @@ class Ember(Gtk.Window):
 
     def _paint_model_chip(self):
         if hasattr(self, "model_chip"):
-            self.model_chip.set_text(f"{cfg.model_label(self._model)}  ▾")
+            arrow = "▴" if getattr(self, "mood_tray", None) and self.mood_tray.get_visible() else "▾"
+            self.model_chip.set_text(f"{cfg.model_label(self._model)}  {arrow}")
 
     def _set_model(self, alias, announce=True):
         self._model = alias
         self._transcript_model = alias
         self._paint_model_chip()
+        for tile in getattr(self, "_mood_tiles", ()):
+            tile.picked = tile.alias == alias
+            tile.queue_draw()
         if announce and self.state != THINKING:
             blurb = next((m["blurb"] for m in cfg.MODELS if m["alias"] == alias), "")
             self._set_status(f"{cfg.model_label(alias)} — {blurb}")
@@ -1105,16 +1604,50 @@ class Ember(Gtk.Window):
         index = aliases.index(self._model) if self._model in aliases else 0
         self._set_model(aliases[(index + 1) % len(aliases)])
 
-    def _show_model_menu(self, event):
-        menu = Gtk.Menu()
-        for number, model in enumerate(cfg.MODELS, 1):
-            item = Gtk.CheckMenuItem(label=f"{model['label']}  —  {model['blurb']}")
-            item.set_draw_as_radio(True)
-            item.set_active(model["alias"] == self._model)
-            item.connect("activate", lambda it, alias=model["alias"]:
-                         it.get_active() and self._set_model(alias))
-            menu.append(item)
-        self._popup(menu, event)
+    def _show_model_menu(self, event=None):
+        self._set_mood_tray(not self.mood_tray.get_visible())
+
+    def _set_mood_tray(self, open_):
+        if self._mood_close_id:
+            GLib.source_remove(self._mood_close_id)
+            self._mood_close_id = None
+        if open_ == self.mood_tray.get_visible():
+            return
+        if open_:
+            for tile in self._mood_tiles:
+                tile.picked = tile.alias == self._model
+                tile.hot = False
+            started = [time.monotonic()]
+
+            def tick():
+                now = time.monotonic()
+                for tile in self._mood_tiles:
+                    tile.tick(now - started[0], ANIM_MS / 1000.0)
+                return GLib.SOURCE_CONTINUE
+
+            tick()
+            self._mood_tick_id = GLib.timeout_add(ANIM_MS, tick)
+        elif self._mood_tick_id:
+            GLib.source_remove(self._mood_tick_id)
+            self._mood_tick_id = None
+        self._show_widget(self.mood_tray, open_, True)
+        self._paint_model_chip()
+        self._relayout()
+
+    def _on_mood_pick(self, tile):
+        for other in self._mood_tiles:
+            other.picked = other is tile
+            other.queue_draw()
+        tile.pop()
+        if tile.alias != self._model:
+            self._set_model(tile.alias)
+        # Long enough to see the pop land, short enough not to feel like a wait.
+        self._mood_close_id = GLib.timeout_add(380, self._close_mood_tray)
+
+    def _close_mood_tray(self):
+        self._mood_close_id = None
+        self._set_mood_tray(False)
+        return GLib.SOURCE_REMOVE
 
     def _popup(self, menu, event):
         self._menu_open = True
@@ -1351,18 +1884,24 @@ class Ember(Gtk.Window):
         start_w = alloc.width if alloc.width > 1 else target_w
         start_h = alloc.height if alloc.height > 1 else target_h
 
-        if not animate or (start_w, start_h) == (target_w, target_h):
+        start_m = self._morph
+        target_m = 0.0 if self.state == IDLE else 1.0
+
+        if not animate or ((start_w, start_h) == (target_w, target_h) and start_m == target_m):
             self._apply_card_size(target_w, target_h)
+            self._set_morph(target_m)
             return
 
         started = time.monotonic()
+        duration = MORPH_DURATION if start_m != target_m else ANIM_DURATION
 
         def tick():
-            progress = min(1.0, (time.monotonic() - started) / ANIM_DURATION)
+            progress = min(1.0, (time.monotonic() - started) / duration)
             eased = ease_out_cubic(progress)
             w = start_w + (target_w - start_w) * eased
             h = start_h + (target_h - start_h) * eased
             self._apply_card_size(int(w), int(h))
+            self._set_morph(lerp(start_m, target_m, eased))
             if progress >= 1.0:
                 self._anim_id = None
                 return GLib.SOURCE_REMOVE
@@ -1377,6 +1916,10 @@ class Ember(Gtk.Window):
         y = max(0, min(ay - h // 2, self.canvas_h - h))
         self._canvas.move(self.card, x, y)
         self._update_input_region(x, y, w, h)
+        # What was asked for, not what GTK allocated: content that is already
+        # shown can force the card wider than requested mid-animation, and it
+        # grows rightwards from x, so the allocation is no guide to the centre.
+        self._card_rect = (x, y, w, h)
 
     def _update_input_region(self, x, y, w, h):
         """Only the card should swallow clicks; the transparent canvas around
@@ -1400,6 +1943,8 @@ class Ember(Gtk.Window):
         if event.detail == Gdk.NotifyType.INFERIOR:
             return False
         self.hovered = False
+        # Let go: the spring carries it back to round with a wobble or two.
+        self._jelly_target = (0.0, 0.0)
         self.dot.queue_draw()
         if self.state == RESPONDING:
             self._start_dwell(self.response_text)
@@ -1491,6 +2036,7 @@ class Ember(Gtk.Window):
         return False
 
     def _on_motion(self, widget, event):
+        self._aim_jelly(widget, event)
         if not self._drag_origin:
             return False
         ox, oy, wx, wy = self._drag_origin
@@ -1498,6 +2044,24 @@ class Ember(Gtk.Window):
         if abs(dx) > 2 or abs(dy) > 2:
             self.move(int(wx + dx), int(wy + dy))
         return False
+
+    def _aim_jelly(self, widget, event):
+        """Point the ring's pull at the cursor, strongest at the ring's edge."""
+        if self.state != IDLE:
+            return
+        coords = widget.translate_coordinates(self.dot, int(event.x), int(event.y))
+        if not coords:
+            return
+        size = min(self.dot.get_allocated_width(), self.dot.get_allocated_height())
+        if size <= 0:
+            return
+        reach = size / 2 * 0.875
+        dx = (coords[0] - self.dot.get_allocated_width() / 2) / reach
+        dy = (coords[1] - self.dot.get_allocated_height() / 2) / reach
+        length = math.hypot(dx, dy)
+        if length > 1:
+            dx, dy = dx / length, dy / length
+        self._jelly_target = (dx, dy)
 
     def _on_button_release(self, widget, event):
         if self._drag_origin:
@@ -1515,6 +2079,9 @@ class Ember(Gtk.Window):
         control = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
         alt = bool(event.state & Gdk.ModifierType.MOD1_MASK)
 
+        if key == "Escape" and self.mood_tray.get_visible():
+            self._set_mood_tray(False)
+            return True
         if key == "Escape":
             if self.busy_working and self._force_cancel_id is None:
                 # First press during a run: warn, don't kill. See FORCE_CANCEL_MS.
@@ -1692,6 +2259,7 @@ class Ember(Gtk.Window):
         directed, cleaned = resolve_model(prompt)
         if directed:
             self._set_model(directed, announce=not cleaned)
+        self._fly_from = self._entry_rect() if cleaned else None
         self.entry.set_text("")
         self._results = []
         self._clear_rows()

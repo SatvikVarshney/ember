@@ -59,7 +59,7 @@ DEFAULTS = {
     "font_size": 18,
     # The resting dot is the whole presence on the desktop, so it has to read as
     # a deliberate object rather than a speck.
-    "dot_size": 76,
+    "dot_size": 150,
 
     # Lives on the desktop layer, under working windows. Floating above turned
     # out to just clutter apps that have no spare UI room.
