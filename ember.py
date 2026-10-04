@@ -32,7 +32,7 @@ gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("GdkX11", "3.0")
-from gi.repository import Gdk, GdkPixbuf, GdkX11, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GdkX11, GLib, GObject, Gtk, Pango, PangoCairo  # noqa: E402
 
 import cairo  # noqa: E402
 
@@ -427,6 +427,137 @@ class MoodTile(Gtk.EventBox):
         return False
 
 
+class ChatInput(Gtk.ScrolledWindow):
+    """The input bar: a text box that wraps and grows with what is typed, up to
+    a few lines and then scrolls. Enter sends, Shift+Enter starts a new line.
+
+    Speaks the small slice of Gtk.Entry the rest of Ember uses (get_text,
+    set_text, set_position, set_placeholder_text, grab_focus), so swapping it
+    in left every caller alone. Signals: "submit" and "text-changed".
+    """
+
+    __gsignals__ = {
+        "submit": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "text-changed": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "resized": (GObject.SignalFlags.RUN_LAST, None, ()),
+    }
+
+    MAX_LINES = 5
+
+    def __init__(self):
+        super().__init__()
+        self.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
+        self.set_shadow_type(Gtk.ShadowType.NONE)
+        self.view = Gtk.TextView()
+        self.view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.view.set_accepts_tab(False)
+        self.view.set_left_margin(15)
+        self.view.set_right_margin(15)
+        self.view.set_top_margin(9)
+        self.view.set_bottom_margin(9)
+        self.view.get_style_context().add_class("ember-input-text")
+        self.add(self.view)
+        self.buffer = self.view.get_buffer()
+        self.buffer.connect("changed", lambda *_: self._on_changed())
+        self.view.connect("key-press-event", self._on_key)
+        self.view.connect_after("draw", self._draw_placeholder)
+        self.view.connect("style-updated", lambda *_: self._fit_lines())
+        # The TextView lays its lines out in idle time, after "changed", so
+        # the height is only known later; it is measured then, and whenever
+        # the layout reports a change (a new width re-wraps the lines too).
+        self._content_h = 0
+        self._measure_id = None
+        self.get_vadjustment().connect("changed", lambda *_: self._queue_measure())
+        self._placeholder = ""
+        self._fit_lines()
+
+    def _fit_lines(self):
+        # Cap the growth at MAX_LINES of the current font; past that it scrolls.
+        metrics = self.view.get_pango_context().get_metrics(None, None)
+        line = (metrics.get_ascent() + metrics.get_descent()) / Pango.SCALE
+        self._max_h = int(line * self.MAX_LINES * 1.25 + 18)
+        self._content_h = 0
+        self._queue_measure()
+
+    def _queue_measure(self):
+        # Low priority: after the TextView's own validation idle has run.
+        if self._measure_id is None:
+            self._measure_id = GLib.idle_add(self._measure, priority=GLib.PRIORITY_LOW)
+
+    def _measure(self):
+        """Size the bar to its text, from the laid-out lines themselves.
+
+        Neither GTK's height-for-width (a few pixels short, clipping the top
+        line) nor the scroll adjustment (never below the current height, so it
+        could only grow) gives the real figure.
+        """
+        self._measure_id = None
+        first_y, _ = self.view.get_line_yrange(self.buffer.get_start_iter())
+        last_y, last_h = self.view.get_line_yrange(self.buffer.get_end_iter())
+        content = (last_y + last_h - first_y) + self.view.get_top_margin() + self.view.get_bottom_margin()
+        height = min(content, self._max_h)
+        overflowing = content > self._max_h
+        # No scrolling at all until it overflows: scrolling while it was still
+        # growing left it a line down with the first line hidden, and the
+        # stale offset never cleared once it had room.
+        self.set_policy(Gtk.PolicyType.NEVER,
+                        Gtk.PolicyType.AUTOMATIC if overflowing else Gtk.PolicyType.NEVER)
+        if height > 1 and height != self._content_h:
+            self._content_h = height
+            self.set_size_request(-1, height)
+            self.emit("resized")
+        if overflowing:
+            self.view.scroll_mark_onscreen(self.buffer.get_insert())
+        else:
+            self.get_vadjustment().set_value(0)
+        return GLib.SOURCE_REMOVE
+
+    def _on_changed(self):
+        self._queue_measure()
+        self.view.queue_draw()
+        self.emit("text-changed")
+
+    def _on_key(self, widget, event):
+        key = Gdk.keyval_name(event.keyval)
+        if key in ("Return", "KP_Enter"):
+            if event.state & Gdk.ModifierType.SHIFT_MASK:
+                return False  # the TextView inserts the newline
+            self.emit("submit")
+            return True
+        return False
+
+    def _draw_placeholder(self, widget, ctx):
+        if not self._placeholder or self.buffer.get_char_count():
+            return False
+        layout = widget.create_pango_layout(self._placeholder)
+        color = widget.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+        ctx.set_source_rgba(color.red, color.green, color.blue, 0.4)
+        ctx.move_to(widget.get_left_margin(), widget.get_top_margin())
+        PangoCairo.show_layout(ctx, layout)
+        return False
+
+    # -- the Entry-shaped API ---------------------------------------------
+
+    def get_text(self):
+        return self.buffer.get_text(self.buffer.get_start_iter(), self.buffer.get_end_iter(), False)
+
+    def set_text(self, text):
+        self.buffer.set_text(text)
+
+    def set_position(self, position):
+        if position < 0:
+            self.buffer.place_cursor(self.buffer.get_end_iter())
+        else:
+            self.buffer.place_cursor(self.buffer.get_iter_at_offset(position))
+
+    def set_placeholder_text(self, text):
+        self._placeholder = text or ""
+        self.view.queue_draw()
+
+    def grab_focus(self):
+        self.view.grab_focus()
+
+
 class Segment(Gtk.Box):
     """One block of model text. Prose renders as markup; fenced code goes
     behind a fold. Updated in place while it streams, rebuilt only when the
@@ -693,13 +824,18 @@ class Ember(Gtk.Window):
         adj = self._chat_scroll.get_vadjustment()
         adj.connect("changed", self._on_chat_adj_changed)
         adj.connect("value-changed", self._on_chat_scrolled)
-        inner.pack_start(self._chat_scroll, True, True, 0)
+        # In a chat the local results float over the bottom of the transcript
+        # instead of taking a slice of the card: pushing the chat and the input
+        # up and down as matches came and went on each keystroke was the shake.
+        self._chat_overlay = Gtk.Overlay()
+        self._chat_overlay.add(self._chat_scroll)
+        inner.pack_start(self._chat_overlay, True, True, 0)
 
-        self.entry = Gtk.Entry()
-        self.entry.set_has_frame(False)
+        self.entry = ChatInput()
         self.entry.get_style_context().add_class("ember-input")
-        self.entry.connect("activate", self._on_submit)
-        self.entry.connect("changed", self._on_typing)
+        self.entry.connect("submit", self._on_submit)
+        self.entry.connect("text-changed", self._on_typing)
+        self.entry.connect("resized", lambda *_: self.state != IDLE and self._relayout())
         inner.pack_start(self.entry, False, False, 0)
 
         # Results sit *below* the input, which is the layout every launcher
@@ -717,6 +853,7 @@ class Ember(Gtk.Window):
         self._results_scroll.set_shadow_type(Gtk.ShadowType.NONE)
         self._results_scroll.add(self.results)
         inner.pack_start(self._results_scroll, False, False, 0)
+        self._results_floating = False
 
         # The model tray: the chip unfolds it inside the card rather than
         # popping a theme-coloured menu out of it.
@@ -772,21 +909,31 @@ class Ember(Gtk.Window):
         .ember-card {{ background-color: transparent; }}
         /* The input is the bubble-to-be: same tint, shape and type as your
            sent messages, stretched edge to edge. */
-        .ember-input {{
+        .ember-card scrolledwindow.ember-input {{
             background-color: alpha({dot}, 0.30);
             background-image: none;
             border: none;
             border-radius: {BUBBLE_RADIUS}px;
             box-shadow: none;
-            outline: none;
-            padding: 9px 15px;
+        }}
+        .ember-input-text, .ember-input-text text {{
+            background-color: transparent;
             color: {text};
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {size - 1}px;
             caret-color: {text};
         }}
-        .ember-input placeholder {{ color: alpha({text}, 0.4); }}
-        .ember-input selection {{ background-color: alpha({dot}, 0.55); color: {text}; }}
+        .ember-input-text text selection {{ background-color: alpha({dot}, 0.55); color: {text}; }}
+        .ember-card scrolledwindow.ember-input undershoot,
+        .ember-card scrolledwindow.ember-input overshoot {{ background: none; }}
+        /* Results floating over a chat need their own paper, or the
+           transcript shows through them. */
+        .ember-card scrolledwindow.ember-float {{
+            background-color: {surface};
+            border: 1px solid alpha({dot}, 0.55);
+            border-radius: 16px;
+            padding: 4px;
+        }}
         .ember-card scrolledwindow,
         .ember-card viewport {{ background-color: transparent; }}
         .ember-card scrollbar {{ background-color: transparent; border: none; }}
@@ -1196,7 +1343,7 @@ class Ember(Gtk.Window):
         width = self._card_width() - 2 * (PAD + RING_BAND)
 
         if self.entry.get_visible():
-            extra += self.entry.get_preferred_height()[1] + spacing
+            extra += self.entry.get_preferred_height_for_width(width)[1] + spacing
         if self.footer.get_visible():
             extra += self.footer.get_preferred_height()[1] + spacing
         if self.mood_tray.get_visible():
@@ -1205,7 +1352,8 @@ class Ember(Gtk.Window):
             _, rows_h = self.results.get_preferred_height()
             rows_h = min(rows_h, MAX_RESULTS_H)
             self._results_scroll.set_size_request(-1, rows_h)
-            extra += rows_h + spacing
+            if not self._results_floating:
+                extra += rows_h + spacing
 
         room = max(40, ceiling - extra)
         if self._msg_scroll.get_visible():
@@ -1245,9 +1393,33 @@ class Ember(Gtk.Window):
         showing_msg, showing_chat, showing_results = self._body_visibility()
         self._show_widget(self._msg_scroll, showing_msg, True)
         self._show_widget(self._chat_scroll, showing_chat, True)
+        self._show_widget(self._chat_overlay, showing_chat)
+        self._float_results(showing_chat)
         self._show_widget(self._results_scroll, showing_results, True)
         self._show_widget(self.new_chip, self.view == CHAT and self.state != THINKING, True)
         self._animate_card(*self._target_geometry(), animate)
+
+    def _float_results(self, floating):
+        """Move the results list between the card body (launcher) and an
+        overlay on the transcript (chat)."""
+        if floating == self._results_floating:
+            return
+        scroll = self._results_scroll
+        style = scroll.get_style_context()
+        scroll.get_parent().remove(scroll)
+        if floating:
+            scroll.set_valign(Gtk.Align.END)
+            scroll.set_margin_bottom(6)
+            style.add_class("ember-float")
+            self._chat_overlay.add_overlay(scroll)
+        else:
+            scroll.set_valign(Gtk.Align.FILL)
+            scroll.set_margin_bottom(0)
+            style.remove_class("ember-float")
+            self._inner.pack_start(scroll, False, False, 0)
+            # Back to its launcher slot: directly under the input.
+            self._inner.reorder_child(scroll, self._inner.get_children().index(self.entry) + 1)
+        self._results_floating = floating
 
     def _set_state(self, state, animate=True):
         if self.state == IDLE and state != IDLE:
@@ -1880,9 +2052,14 @@ class Ember(Gtk.Window):
             GLib.source_remove(self._anim_id)
             self._anim_id = None
 
-        alloc = self.card.get_allocation()
-        start_w = alloc.width if alloc.width > 1 else target_w
-        start_h = alloc.height if alloc.height > 1 else target_h
+        # From the size last asked for, not the allocation: content that has
+        # just grown can make GTK hand the card more than it requested for a
+        # frame, and animating back from that read as the card bouncing.
+        _, _, start_w, start_h = self._card_rect
+        if start_w <= 1 or start_h <= 1:
+            alloc = self.card.get_allocation()
+            start_w = alloc.width if alloc.width > 1 else target_w
+            start_h = alloc.height if alloc.height > 1 else target_h
 
         start_m = self._morph
         target_m = 0.0 if self.state == IDLE else 1.0
