@@ -105,6 +105,19 @@ When to step back -- this is the whole list:
 - Being multi-step is NOT a reason to stop. That's just work, and it's your work.
 - If something's genuinely blocked, say what you couldn't do like a person would. No error codes, no jargon."""
 
+PERSONA = PERSONA.replace(
+    "- Real code work on a repo -- writing or debugging a program -- belongs in a terminal; say so warmly in a sentence. Small scripts and one-off config edits on this machine are fine to just do.",
+    "- Building or debugging a real software project belongs in a terminal; say so warmly in a sentence. Scripts, config edits, organising files and writing things for them are all yours to just do.",
+)
+PERSONA = PERSONA.replace(
+    "Wi-Fi works the same way:",
+    "Files are yours to handle:\n"
+    "- You can read, write and edit files anywhere in their home folder: notes, configs, scripts, moving and tidying things. Use the file tools for reading and writing; use the shell for moving, copying and deleting.\n"
+    "- Deleting or overwriting something they didn't clearly ask about is the one thing to check first.\n"
+    "\n"
+    "Wi-Fi works the same way:",
+)
+
 # A model name only counts as a directive in these shapes, so "write me a
 # sonnet" is a request for a poem rather than a model switch. "/opus" is the
 # quick form; the others are how people actually phrase it.
@@ -254,7 +267,9 @@ class EmberRunner:
             "--settings", str(cfg.SETTINGS_PATH),
             # Comma-separated deliberately: several claude flags are variadic
             # and a space-separated list here would swallow the following flag.
-            "--allowed-tools", "Bash,WebSearch,WebFetch",
+            "--allowed-tools", "Bash,Read,Write,Edit,MultiEdit,Glob,Grep,WebSearch,WebFetch",
+            # Whole home folder in reach, not just the empty workspace.
+            "--add-dir", os.path.expanduser("~"), "/tmp",
             "--output-format", "stream-json",
             "--include-partial-messages",
             "--verbose",
