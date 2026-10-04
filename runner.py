@@ -215,10 +215,9 @@ def list_in_resume_picker(session_id):
             data = path.read_text()
             if '"entrypoint":"sdk-cli"' not in data:
                 continue
-            tmp = path.with_suffix(".jsonl.tmp")
-            tmp.write_text(data.replace('"entrypoint":"sdk-cli"', '"entrypoint":"cli"'))
-            os.chmod(tmp, path.stat().st_mode)
-            os.replace(tmp, path)
+            with open(path, "r+") as f:  # in place: keeps the ~ hard link valid
+                f.write(data.replace('"entrypoint":"sdk-cli"', '"entrypoint":"cli"'))
+                f.truncate()
         except OSError:
             pass
 
