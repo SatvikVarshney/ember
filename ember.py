@@ -660,9 +660,11 @@ class Ember(Gtk.Window):
         self._ellipsis_id = None
         self._ellipsis_step = 0
         self._force_cancel_id = None
-        # A TinyStories sentence about the step under way, which takes over the
-        # activity line once it lands (a second or so in). Cleared whenever
-        # the step changes, so it never describes something already finished.
+        # A TinyStories sentence about what is under way, shown above the
+        # input once it lands (a second or two in). The first is told
+        # from the request itself, to cover the long wait before any step;
+        # each step's line then replaces the last one rather than blanking it,
+        # since quick steps would otherwise never leave one on screen.
         self._story_line = ""
         self._storyteller = storyteller.Storyteller() if self.config.get("story_lines", True) else None
 
@@ -837,6 +839,12 @@ class Ember(Gtk.Window):
         self._chat_overlay.add(self._chat_scroll)
         inner.pack_start(self._chat_overlay, True, True, 0)
 
+        # The tiny story about what Ember is up to, right above the input
+        # where the eye already is. Only there while a run has one to tell.
+        self.story = _wrap_label(css="ember-story", selectable=False)
+        self._show_widget(self.story, False)
+        inner.pack_start(self.story, False, False, 0)
+
         self.entry = ChatInput()
         self.entry.get_style_context().add_class("ember-input")
         self.entry.connect("submit", self._on_submit)
@@ -969,6 +977,13 @@ class Ember(Gtk.Window):
             font-family: "{font}", "Cantarell", sans-serif;
             font-size: {max(12, size - 3)}px;
             font-style: italic;
+        }}
+        .ember-story {{
+            color: alpha({text}, 0.72);
+            font-family: "{font}", "Cantarell", sans-serif;
+            font-size: {size - 1}px;
+            font-style: italic;
+            padding: 0 6px;
         }}
         .ember-fold {{
             color: alpha({text}, 0.42);
@@ -1305,18 +1320,22 @@ class Ember(Gtk.Window):
         if self._force_cancel_id is not None:
             self._set_status("still working — esc again to stop")
             return
-        queued = f"  ·  {len(self._queue)} queued" if self._queue else ""
-        if self._story_line:
-            self._set_status(f"{self._story_line}{queued}")
-            return
         dots = "." * (1 + self._ellipsis_step % 3)
+        queued = f"  ·  {len(self._queue)} queued" if self._queue else ""
         self._set_status(f"{self._activity or 'thinking'}{dots}{queued}")
+
+    def _set_story(self, line):
+        if line == self._story_line:
+            return
+        self._story_line = line
+        self.story.set_text(line)
+        self._show_widget(self.story, bool(line) and self.state != IDLE)
+        self._relayout()
 
     def _tell_story(self, step):
         """Ask TinyStories for a line about this step. It is used only if the
         same run is still thinking when it arrives; a newer step's request
         replaces this one in the storyteller anyway."""
-        self._story_line = ""
         if not self._storyteller:
             return
         generation = self._generation
@@ -1328,8 +1347,7 @@ class Ember(Gtk.Window):
 
     def _on_story(self, generation, line):
         if generation == self._generation and self.state == THINKING:
-            self._story_line = line
-            self._paint_activity()
+            self._set_story(line)
         return GLib.SOURCE_REMOVE
 
     def _set_status(self, text, action=None):
@@ -1373,6 +1391,8 @@ class Ember(Gtk.Window):
 
         if self.entry.get_visible():
             extra += self.entry.get_preferred_height_for_width(width)[1] + spacing
+        if self.story.get_visible():
+            extra += self.story.get_preferred_height_for_width(width)[1] + spacing
         if self.footer.get_visible():
             extra += self.footer.get_preferred_height()[1] + spacing
         if self.mood_tray.get_visible():
@@ -1482,7 +1502,7 @@ class Ember(Gtk.Window):
             if previous == THINKING:
                 self._set_status("")
             self._activity = ""
-            self._story_line = ""
+            self._set_story("")
 
         # Any route back to rest also drops the hotkey raise, so Ember can
         # never get stranded above the working windows.
@@ -2559,7 +2579,7 @@ class Ember(Gtk.Window):
         self._save_transcript()
 
         self._activity = ""
-        self._story_line = ""
+        self._set_story("")
         self._set_status("")
         self._begin_turn()
         # Anything still waiting belongs after this reply, not above it.
@@ -2569,6 +2589,7 @@ class Ember(Gtk.Window):
             self._set_state(THINKING)
         self._pending_turn = {"prompt": prompt, "started": time.monotonic(), "model": self._model}
         self._generation += 1
+        self._tell_story({"description": " ".join(prompt.split()[:12])})
         generation = self._generation
         model = self._model
 
@@ -2621,7 +2642,6 @@ class Ember(Gtk.Window):
         elif kind == "tool":
             if self.state == THINKING:
                 self._activity = TOOL_ACTIVITY.get(event.get("name"), "working")
-                self._story_line = ""
                 self._paint_activity()
 
         elif kind == "step":

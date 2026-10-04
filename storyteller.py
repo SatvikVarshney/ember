@@ -184,7 +184,7 @@ class Teller:
             logits = self.model.forward([token], cache)
         return self.tokenizer.decode(out)
 
-    def line_for(self, task, attempts=4):
+    def line_for(self, task, attempts=2):
         """One story sentence about what Ember is doing right now.
 
         The Instruct model was trained on "Summary: ... Words: ... Story: ..."
