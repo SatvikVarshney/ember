@@ -40,6 +40,7 @@ import config as cfg  # noqa: E402
 import ipc  # noqa: E402
 import launcher  # noqa: E402
 import render  # noqa: E402
+import storyteller  # noqa: E402
 import tracker  # noqa: E402
 from runner import EmberRunner, resolve_model, strip_markdown  # noqa: E402
 
@@ -659,6 +660,11 @@ class Ember(Gtk.Window):
         self._ellipsis_id = None
         self._ellipsis_step = 0
         self._force_cancel_id = None
+        # A TinyStories sentence about the step under way, which takes over the
+        # activity line once it lands (a second or so in). Cleared whenever
+        # the step changes, so it never describes something already finished.
+        self._story_line = ""
+        self._storyteller = storyteller.Storyteller() if self.config.get("story_lines", True) else None
 
         # The in-flight model turn, held open from _ask_model until whichever
         # terminal event closes it. One slot rather than a stack because the
@@ -1299,9 +1305,32 @@ class Ember(Gtk.Window):
         if self._force_cancel_id is not None:
             self._set_status("still working — esc again to stop")
             return
-        dots = "." * (1 + self._ellipsis_step % 3)
         queued = f"  ·  {len(self._queue)} queued" if self._queue else ""
+        if self._story_line:
+            self._set_status(f"{self._story_line}{queued}")
+            return
+        dots = "." * (1 + self._ellipsis_step % 3)
         self._set_status(f"{self._activity or 'thinking'}{dots}{queued}")
+
+    def _tell_story(self, step):
+        """Ask TinyStories for a line about this step. It is used only if the
+        same run is still thinking when it arrives; a newer step's request
+        replaces this one in the storyteller anyway."""
+        self._story_line = ""
+        if not self._storyteller:
+            return
+        generation = self._generation
+
+        def landed(line):
+            GLib.idle_add(self._on_story, generation, line)
+
+        self._storyteller.tell(step.get("description") or self._activity, landed)
+
+    def _on_story(self, generation, line):
+        if generation == self._generation and self.state == THINKING:
+            self._story_line = line
+            self._paint_activity()
+        return GLib.SOURCE_REMOVE
 
     def _set_status(self, text, action=None):
         """Footer text. `action`, when given, makes it clickable."""
@@ -1453,6 +1482,7 @@ class Ember(Gtk.Window):
             if previous == THINKING:
                 self._set_status("")
             self._activity = ""
+            self._story_line = ""
 
         # Any route back to rest also drops the hotkey raise, so Ember can
         # never get stranded above the working windows.
@@ -2207,6 +2237,9 @@ class Ember(Gtk.Window):
             self._show_menu(event)
             return True
         if event.button == 1:
+            target = Gtk.get_event_widget(event)
+            if isinstance(target, Gtk.Label) and target.get_selectable():
+                return False  # selecting text to copy, not dragging Ember about
             self._drag_origin = (event.x_root, event.y_root, *self.get_position())
             if self.state == IDLE:
                 self._open_input()
@@ -2274,6 +2307,8 @@ class Ember(Gtk.Window):
             self._cancel_dwell()
             self._set_state(IDLE)
             return True
+        if control and key in ("c", "C") and self._copy_selection():
+            return True
         if control and key in ("t", "T"):
             self._open_in_terminal()
             return True
@@ -2315,8 +2350,58 @@ class Ember(Gtk.Window):
             return True
         return False
 
+    # -- copying -------------------------------------------------------------
+
+    def _selected_text(self):
+        """Whatever is selected in the chat. Reply labels are selectable but
+        never focusable (the entry has to keep the keyboard), so Ctrl+C goes
+        to the entry, not to them, and has to be routed here instead."""
+        def walk(widget):
+            if isinstance(widget, Gtk.Label):
+                if widget.get_selectable():
+                    found, start, end = widget.get_selection_bounds()
+                    if found and end > start:
+                        return widget.get_text()[start:end]
+            elif isinstance(widget, Gtk.Container):
+                for child in widget.get_children():
+                    text = walk(child)
+                    if text:
+                        return text
+            return ""
+        return walk(self.chat_box)
+
+    def _last_reply_text(self):
+        record = self._turn["record"] if self._turn else next(
+            (m for m in reversed(self._messages) if m.get("role") == "ember"), None)
+        if not record:
+            return ""
+        texts = [p.get("text", "") for p in record.get("parts") or [] if p.get("kind") == "text"]
+        return strip_markdown("\n\n".join(t for t in texts if t.strip()))
+
+    def _to_clipboard(self, text):
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(text, -1)
+        clipboard.store()
+
+    def _copy_selection(self):
+        """Ctrl+C: the entry's own selection wins; otherwise a reply's."""
+        if self.entry.buffer.get_has_selection():
+            return False
+        text = self._selected_text()
+        if text:
+            self._to_clipboard(text)
+        return bool(text)
+
     def _show_menu(self, event):
         menu = Gtk.Menu()
+
+        selected = self._selected_text()
+        reply = self._last_reply_text()
+        copy = Gtk.MenuItem(label="Copy\tCtrl+C" if selected else "Copy last reply")
+        copy.set_sensitive(bool(selected or reply))
+        copy.connect("activate", lambda *_: self._to_clipboard(selected or reply))
+        menu.append(copy)
+        menu.append(Gtk.SeparatorMenuItem())
 
         new = Gtk.MenuItem(label="New chat\tCtrl+N")
         new.set_sensitive(bool(self._messages) and not self.busy_working)
@@ -2474,6 +2559,7 @@ class Ember(Gtk.Window):
         self._save_transcript()
 
         self._activity = ""
+        self._story_line = ""
         self._set_status("")
         self._begin_turn()
         # Anything still waiting belongs after this reply, not above it.
@@ -2535,6 +2621,7 @@ class Ember(Gtk.Window):
         elif kind == "tool":
             if self.state == THINKING:
                 self._activity = TOOL_ACTIVITY.get(event.get("name"), "working")
+                self._story_line = ""
                 self._paint_activity()
 
         elif kind == "step":
@@ -2543,6 +2630,7 @@ class Ember(Gtk.Window):
             elif self._turn is not None:
                 self._turn_step(event)
                 self._activity = _activity_from(event)
+                self._tell_story(event)
                 self._paint_activity()
 
         elif kind == "rate_limit":
